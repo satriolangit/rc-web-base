@@ -1,0 +1,97 @@
+@import '@fontsource-variable/plus-jakarta-sans';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 27.3% 97.8%;
+    --foreground: 215 27.9% 16.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 27.9% 16.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 27.9% 16.9%;
+    --primary: 262.3 75.4% 41.4%;
+    --primary-foreground: 0 0% 100%;
+    --primary-hover: 262.4 80.4% 30%;
+    --primary-light: 258.3 89.5% 66.3%;
+    --secondary: 220 14.3% 95.9%;
+    --secondary-foreground: 215 27.9% 16.9%;
+    --muted: 220 14.3% 95.9%;
+    --muted-foreground: 220 8.9% 46.1%;
+    --accent: 261.4 70% 96.1%;
+    --accent-foreground: 262.4 80.4% 30%;
+    --destructive: 0 72.2% 50.6%;
+    --destructive-foreground: 0 0% 100%;
+    --destructive-strong: 0 73.7% 41.8%;
+    --success: 142.1 76.2% 36.3%;
+    --success-foreground: 0 0% 100%;
+    --success-strong: 142.4 71.8% 29.2%;
+    --warning: 37.7 92.1% 50.2%;
+    --warning-foreground: 215 27.9% 16.9%;
+    --warning-strong: 26 90.5% 37.1%;
+    --info: 198.6 88.7% 48.4%;
+    --info-foreground: 215 27.9% 16.9%;
+    --info-strong: 201.3 96.3% 32.2%;
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 262.3 75.4% 41.4%;
+    --radius: 0.625rem;
+  }
+
+  .dark {
+    --background: 250.9 24.4% 8.8%;
+    --foreground: 220 14.3% 95.9%;
+    --card: 249.5 26% 14.3%;
+    --card-foreground: 220 14.3% 95.9%;
+    --popover: 249.5 26% 14.3%;
+    --popover-foreground: 220 14.3% 95.9%;
+    --primary: 255.1 91.7% 76.3%;
+    --primary-foreground: 250.9 24.4% 8.8%;
+    --primary-hover: 253.8 93.5% 81.8%;
+    --primary-light: 255.1 91.7% 76.3%;
+    --secondary: 249.5 18.4% 20.2%;
+    --secondary-foreground: 220 14.3% 95.9%;
+    --muted: 249.5 18.4% 20.2%;
+    --muted-foreground: 217.9 10.6% 64.9%;
+    --accent: 254.5 29.3% 19.4%;
+    --accent-foreground: 252.5 94.8% 85.1%;
+    --destructive: 0 72.2% 50.6%;
+    --destructive-foreground: 0 0% 100%;
+    --destructive-strong: 0 90.6% 70.8%;
+    --success: 142.1 76.2% 36.3%;
+    --success-foreground: 0 0% 100%;
+    --success-strong: 141.9 69.2% 58%;
+    --warning: 37.7 92.1% 50.2%;
+    --warning-foreground: 215 27.9% 16.9%;
+    --warning-strong: 43.3 96.4% 56.3%;
+    --info: 198.6 88.7% 48.4%;
+    --info-foreground: 215 27.9% 16.9%;
+    --info-strong: 198.4 93.2% 59.6%;
+    --border: 249.5 18.4% 20.2%;
+    --input: 249.5 18.4% 20.2%;
+    --ring: 255.1 91.7% 76.3%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

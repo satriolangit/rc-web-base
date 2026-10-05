@@ -1,0 +1,54 @@
+{
+  "app": {
+    "title": "ARSI Platform",
+    "client": "Klien",
+    "modules": "Modul aktif"
+  },
+  "nav": {
+    "home": "Beranda"
+  },
+  "actions": {
+    "cancel": "Batal",
+    "save": "Simpan",
+    "close": "Tutup",
+    "signOut": "Keluar",
+    "toggleTheme": "Ganti tema",
+    "reload": "Muat ulang",
+    "openNotifications": "Buka notifikasi"
+  },
+  "home": {
+    "title": "Selamat datang",
+    "description": "Shell platform modular berjalan dengan baik."
+  },
+  "notFound": {
+    "title": "Halaman tidak ditemukan",
+    "description": "Halaman yang Anda cari tidak tersedia.",
+    "backHome": "Kembali ke beranda"
+  },
+  "routeError": {
+    "title": "Terjadi kesalahan",
+    "description": "Kesalahan tak terduga terjadi saat merender halaman ini."
+  },
+  "locale": {
+    "label": "Bahasa",
+    "en": "English",
+    "id": "Bahasa Indonesia"
+  },
+  "theme": {
+    "light": "Terang",
+    "dark": "Gelap"
+  },
+  "search": {
+    "label": "Cari produk",
+    "placeholder": "Cari produk..."
+  },
+  "notifications": {
+    "title": "Notifikasi",
+    "empty": "Belum ada notifikasi.",
+    "markAllRead": "Tandai semua dibaca",
+    "markRead": "Tandai dibaca",
+    "remove": "Hapus notifikasi",
+    "clearAll": "Hapus semua",
+    "openWithCount": "Notifikasi, {{count}} belum dibaca"
+  }
+}

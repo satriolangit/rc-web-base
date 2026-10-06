@@ -1,5 +1,5 @@
 {
-  "client": "client-a",
+  "client": "client-bcad",
   "modules": ["user-management", "product-management", "module-sample"],
   "apiBase": "https://dummyjson.com",
   "featureFlags": {

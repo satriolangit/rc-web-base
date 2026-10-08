@@ -1,0 +1,16 @@
+**/node_modules
+**/dist
+**/coverage
+**/.git
+web-container/current-client
+**/*.log
+**/.DS_Store
+**/.env
+**/.env.*
+docs
+.gitnexus
+.agents
+.claude
+skills-lock.json
+web-extension-client-bcad
+web-extension-template

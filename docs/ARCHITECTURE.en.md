@@ -1,587 +1,722 @@
 # Architecture Guide — Modular Web Platform
 
-**Version**: 0.3.0
-**Audience**: Developer, tech lead, architect
-**Status**: Living document
+This document explains **how this modular web platform is put together**: one stable *container* (shell), business feature modules selected via config, and one *extension* per client for customization. It targets new developers who already know React hooks and basic TypeScript; every technical term is defined the first time it appears. Part I (§1–§8) provides orientation and dissects each mechanism; Part II (§9–§15) is the working reference. This document explains *how it works*; binding rules (must/must not) live in `CONTRACT`. Indonesian version: `ARCHITECTURE.md`.
+
+**Reader map:**
+
+| If you...                                                            | Start from                        |
+| -------------------------------------------------------------------- | --------------------------------- |
+| Are new to the project and need the big picture                      | Part I — Orientation (§1–§3)      |
+| Need technical detail on one mechanism (DI, routing, slots, build)   | Part I — Mechanisms (§4–§8)       |
+| Need a compact reference (layers, patterns, aliases, governance)     | Part II — Reference (§9–§15)      |
+| Need normative rules (must/must not)                                 | `CONTRACT`                        |
+| Need deployment/operational steps                                    | `DEPLOYMENT-GUIDE`                |
+| Need step-by-step code examples                                      | `DEVELOPER-GUIDE`                 |
 
 ---
 
-## Table of Contents
+## 1. What Is Built & Why Modular
 
-1. Overview
-2. Design Principles
-3. Repo & Ownership
-4. Layer Architecture
-5. Boot Sequence
-6. Configuration
-7. Dependency Injection — deps + hooks
-8. State Management
-9. Data Fetching
-10. Service Registry
-11. UI Kit & Shared Components
-12. Override Mechanisms
-13. i18n, Toast, Modal
-14. Event Bus
-15. Path Mapping & Aliases
-16. Build & Deployment
-17. CI/CD
-18. Governance
-19. Development Workflow
-20. Anti-patterns
-21. Roadmap
+A modular web platform for **multiple clients**: one codebase is deployed for many clients, with per-client module selection and customization. *Modular* means the app is not built as one monolithic block; it is assembled from three kinds of parts:
 
----
+| Part          | Role                                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------------------- |
+| **Container** | Application shell: boot, config, dependency injection (DI), auth, routing host, layout, and every registry     |
+| **Module**    | Self-contained business feature: pages, menu, services, modals, state, and translations                        |
+| **Extension** | Customization for one client: slots, route overrides, service wrappers, extra services and translations        |
 
-## 1. Overview
+Jargon: *dependency injection* (DI) means the container prepares a single object holding all services (called `deps`) and hands it to modules and extensions at boot, so they never create those instances themselves.
 
-### 1.1 What Is Being Built
+**Platform characteristics:**
 
-Modular web platform for **multiple clients** with a stable core and isolated per-client customization.
+- React 19 + Vite + TypeScript.
+- Multi-client: many clients share the same container and modules; differences live in the extension.
+- Dozens of business modules — currently `user-management`, `product-management`, and `module-sample`.
+- Backend microservices are reached via **path-based routing** (`/api/<service>`), e.g. the `auth` service at `/api/auth` (`web-container/src/di/deps.ts:45`).
+- Per-client deployment: the base is built once as a base image, then each client builds a client image `FROM` that base image (see `DEPLOYMENT-GUIDE` §1).
 
-**Characteristics:**
+**A quick example.** The `module-sample` module registers its own pages, menu, service, and modal via `init(deps)` (`web-modules/modules/module-sample/index.tsx:14`). The `client-a` extension never touches that module; it fills the `module-sample.overviewPanel` slot and overrides the `/module-sample/extension-points` route (`web-extension-client-a/src/index.tsx:32`). This pattern repeats throughout the document: **the base provides extension points, the client plugs in**.
 
-- 50+ business modules in the future
-- 5+ clients each with their own customization
-- React 19 + Vite + TypeScript
-- Backend microservices accessed via path-based routing (nginx)
-- Per-client deploy via generic CI/CD (client image `FROM` the base image)
+### 1.1 Without Modular vs With Modular
 
-### 1.2 Why Modular
+| Aspect                              | Without modular                        | With modular                                        |
+| ----------------------------------- | -------------------------------------- | --------------------------------------------------- |
+| A change for client A               | Can break client B                     | Isolated inside client A's extension                |
+| Bundle                              | Every feature is loaded                | Only modules listed in `config.modules`             |
+| Onboarding a new client developer   | Must dig through the entire codebase   | Base repo (read) + small extension is enough        |
+| Product cadence vs client requests  | Get in each other's way                | Run in parallel: stable base, isolated extension    |
 
-Without modular:
+### 1.2 Seven Philosophy Principles
 
-- A single change in client A can break client B.
-- Bundle size balloons because all features are loaded.
-- Onboarding a new client developer is slow.
-- Product development is disrupted by client customization.
+These principles shape every design decision. Their hard rules live in `CONTRACT` §1.
 
-With modular:
-
-- Stable base, isolated extension.
-- Selective bundle per client.
-- Fast onboarding: a small base repo + extension repo.
-- Product and client development run in parallel.
-
-### 1.3 Philosophy
-
-| Principle                          | Implication                                        |
-| ---------------------------------- | -------------------------------------------------- |
-| **Container doesn't know modules** | Discovery-based, not hardcoded                     |
-| **Modules don't know extensions**  | Slot-based, not conditional                        |
-| **Extension knows the base**       | Extension may import the public API                |
-| **Public API as contract**         | Each layer exposes via `public.ts` / `index.ts`    |
-| **Config-driven**                  | URL and module selection from runtime config       |
-| **Fail-fast**                      | Duplicate service, slot, route → error             |
-| **One image, many environments**   | Runtime config, not build-time                     |
+| Principle                          | Meaning                                                    | Consequence                                                                     |
+| ---------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Container doesn't know modules** | The shell never imports module code                        | Modules are found from `config.modules` (discovery), not hardcoded              |
+| **Modules don't know extensions**  | A module never mentions a client name                      | Customization goes through slots, not `if (client === 'client-a')`              |
+| **Extension knows the base**       | An extension may import the container and module public APIs | The extension has one clear entry point: `init(deps)`                         |
+| **Public API as contract**         | Each layer exposes only specific files                     | `@arsi/container`, `@arsi/shared`, `modules/<name>/public.ts` (`CONTRACT` §1.4) |
+| **Config-driven**                  | Module selection and URLs come from runtime config         | No hardcoding; config is injected when the container starts                     |
+| **Fail-fast**                      | Duplicate service, slot, or route throws immediately       | Mistakes surface at boot, not silently in production                            |
+| **One image, many environments**   | Staging/production differ only by env vars at start        | Change API base/modules without rebuilding the image                            |
 
 ---
 
-## 2. Design Principles
+## 2. Repo Map & Ownership
 
-### 2.1 Separation of Concerns
+In production there are **two kinds of repos**: one **base repo** owned by the platform team, and one **client repo** per client owned by that client's developer. The tables below map their contents.
 
-| Concern                       | Owner                       |
-| ----------------------------- | --------------------------- |
-| Shell (auth, routing, layout) | Container                   |
-| UI primitives                 | Shared                      |
-| Business features             | Module                      |
-| Client customization          | Extension                   |
-| Global state                  | Container (Zustand)         |
-| Feature state                 | Module (Zustand)            |
-| Server state                  | React Query (via container) |
-| Config                        | Container (runtime)         |
+**Base repo (`arsi-web-base`):**
 
-### 2.2 Dependency Direction
+| Path                           | Contents                                                                                                                             | Owner         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ | ------------- |
+| `web-container/`               | Shell: boot (`src/bootstrap/`), DI (`src/di/deps.ts`), auth, routing host, layout, registries, API client, i18n, toast/modal/notifications | Platform team |
+| `web-modules/`                 | `shared/` (UI kit, hooks, utils) + `modules/<name>/` (business features)                                                             | Platform team |
+| `web-extension-default/`       | No-op extension used to run the base standalone (`client: "base"`)                                                                   | Platform team |
+| `web-extension-template/`      | Starting point for a new client repo                                                                                                 | Platform team |
+| `docs/`                        | `ARCHITECTURE`, `CONTRACT`, `DEVELOPER-GUIDE`, `DEPLOYMENT-GUIDE`                                                                    | Platform team |
+| `Dockerfile` + `.dockerignore` | Builds 2 base images: builder (`node:22-alpine`) and runtime (`nginx:1.27-alpine`)                                                   | Platform team |
+| `ci/build-base.sh`             | Base image build + push script                                                                                                       | Platform team |
 
-```
-Container  →  (does not import anything from other layers)
-Shared     →  (does not import anything)
-Module     →  Container (public), Shared
-Extension  →  Container (public), Shared, Module (public)
-```
+**Client repo (`arsi-web-client-<x>`, checkout `web-extension-client-<x>`):**
 
-**Rule:** dependencies may only point to lower layers. No upward dependency.
+| Path                      | Contents                                                                              | Owner           |
+| ------------------------- | ------------------------------------------------------------------------------------- | --------------- |
+| `manifest.json`           | Client identity: `client`, `baseVersion` (exact pin to the base tag), modules, overrides | Client developer |
+| `src/index.tsx`           | Entry point `init(deps)` — the extension's only way in                                 | Client developer |
+| `src/components/`         | Client-specific components (e.g. `AuditButton`)                                        | Client developer |
+| `src/overrides/<module>/` | Per-module overrides (e.g. `user-management/ClientAUserDetail.tsx`)                    | Client developer |
+| `Dockerfile`              | Client image: `FROM` base builder → `FROM` base runtime                               | Client developer |
+| `ci/build-client.sh`      | Client image build + push script                                                       | Client developer |
 
-### 2.3 Client Isolation
+> **Sample workspace note.** This repo is a sample workspace with a **flat layout**: `web-container/`, `web-modules/`, `web-extension-default/`, `web-extension-template/`, and `web-extension-client-a/` sit side by side in one folder. In production, `web-extension-client-<x>` is the contents of a separate repo `arsi-web-client-<x>`; during development that repo is checked out next to the base repo because path mapping assumes a *sibling* position (`DEPLOYMENT-GUIDE` Tutorial A).
 
-- Each client has its own extension repo.
-- Client A cannot access client B's code.
-- Changes in client A do not affect client B.
-- CI/CD per client is independent.
+### 2.1 Who Changes What
 
-### 2.4 YAGNI vs Investment
+| Change                                        | Changed in                     | Discussion needed?       |
+| --------------------------------------------- | ------------------------------ | ------------------------ |
+| Add/modify a business module                  | `web-modules/modules/<name>`   | No                       |
+| Add a shared UI component                     | `web-modules/shared`           | No                       |
+| Change the shell, DI, or container public API | `web-container`                | Yes — lead dev           |
+| Customize one client                          | `web-extension-client-<x>`     | No                       |
+| Bump the `baseVersion` a client uses          | the client's `manifest.json`   | Yes — schedule base adoption |
+| Create a new client repo                      | Copy `web-extension-template`  | Yes                      |
 
-| Phase      | Focus                                            |
-| ---------- | ------------------------------------------------ |
-| Prototype  | Path mapping, module selection via config        |
-| Production | Contract test, versioning, observability         |
-| Scale      | Azure Artifacts, release train, package registry |
+Ownership principle: a client developer **may read** the base repo but **may not change it**; base-level needs are proposed via a PR to the platform team. Conversely, the base never touches extension code.
 
-Don't over-engineer at the start. But also don't accrue architecture debt that is hard to pay off.
+### 2.2 What Is Not in the Client Repo
 
----
+The client repo intentionally stays small. It does not contain:
 
-## 3. Repo & Ownership
-
-### 3.1 Repo Structure
-
-Production: 1 base repo + 1 repo per client.
-
-```
-arsi-web-base/                          # base repo
-├── web-container/                      # Application shell
-├── web-modules/                        # Shared + business modules
-├── web-extension-default/              # Default extension (client "base") for the base image
-└── web-extension-template/             # Template for new clients
-
-arsi-web-client-<x>/                    # client repo (1 per client)
-└── web-extension-client-<x>/           # client repo checkout — placed inside the base repo during dev
-```
-
-**Must be side by side** while using path mapping: the client folder must be a sibling of `web-container`/`web-modules` (see §19.1).
-
-### 3.2 Ownership Matrix
-
-| Repo                                                        | Owner                    | Contributors                     |
-| ----------------------------------------------------------- | ------------------------ | -------------------------------- |
-| `web-container` (repo `arsi-web-base`)                      | Platform team / lead dev | Internal developers              |
-| `web-modules` (repo `arsi-web-base`)                        | Platform team / lead dev | Internal developers              |
-| `web-extension-default` (repo `arsi-web-base`)              | Platform team / lead dev | Internal developers              |
-| `web-extension-template` (repo `arsi-web-base`)             | Platform team            | —                                |
-| `web-extension-client-<x>` (repo `arsi-web-client-<x>`)     | Client developer         | Can view base, but cannot modify |
-
-### 3.3 Repo Contents
-
-**`web-container`:**
-
-- Bootstrap & DI
-- Auth integration
-- Routing host
-- Layout
-- API client & registry
-- Query client
-- i18n
-- Toast, Modal
-- Event bus
-- Slot, Route, Menu registry
-- Global store (Zustand)
-- Tailwind config
-- Docker + nginx
-- `CONTRACT.md`
-
-**`web-modules`:**
-
-- `shared/` — UI kit, hooks, utils
-- `modules/<name>/` — business features
-- Each module has `public.ts` as its contract
-
-**`web-extension-default`:**
-
-- Default (no-op) extension used by the standalone base image (`client: "base"`)
-- Default build target (`CLIENT=base npm run build:client` → `dist/base/`)
-
-**`web-extension-client-<x>`:**
-
-- `src/index.ts` — entry point `init(deps)`
-- `src/components/` — client-specific components
-- `src/overrides/<module>/` — per-module overrides
-- `manifest.json` — declares modules & versions
-
-**`web-extension-template`:**
-
-- Same as an extension, but empty
-- Lives in the base repo; copied when creating a new client repo (`arsi-web-client-<x>`)
+- `web-container/` and `web-modules/` — they come from the base builder image at client image build time (`/app/web-container`, `/app/web-modules`).
+- `moduleLoaders.generated.ts` — generated by the container from each module's `package.json`, not copied to clients.
+- `/config.json` — written by `entrypoint.sh` at container start from env vars (`VITE_*`), not a committed file.
+- Other clients' code — there is no cross-client access.
 
 ---
 
-## 4. Layer Architecture
+## 3. Ten-Minute Mental Model
 
-### 4.1 Layer Diagram
+### 3.1 Building Analogy
+
+Think of the platform as a **building**:
+
+- The **container** is the building plus its shared facilities — structure, electricity, elevators, security. It provides auth, routing, layout, DI, and registries; it does not know what each room holds.
+- A **module** is a tenant that furnishes its own room — a business feature (`user-management`, `module-sample`) complete with its pages, menu, services, and state.
+- An **extension** is decoration or renovation for one specific client — adding a panel, replacing a page, or wrapping logic, without changing the building's foundation.
+
+### 3.2 Three Terms
+
+| Term          | Short definition                                                                                                                                                            | Example in this repo                             |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| **Container** | The React application that boots, provides config, DI, auth, routing host, layout, and every registry. Only its public API (`@arsi/container`) may be used by modules/extensions. | `web-container/src/di/deps.ts:23`                |
+| **Module**    | A self-contained business feature package that registers menu, routes, services, modals, and i18n via `init(deps)`; its contract is `public.ts`. Selected per client via `config.modules`. | `web-modules/modules/module-sample/index.tsx:14` |
+| **Extension** | A per-client customization package that also has `init(deps)`; it fills slots, overrides routes, and adds services/i18n. It is never imported by the base.                  | `web-extension-client-a/src/index.tsx:32`        |
+
+### 3.3 Block Diagram
+
+```mermaid
+flowchart LR
+    subgraph Base repo
+        C[Container<br/>routing, DI, layout, UI kit]
+        M1[Module user-management]
+        M2[Module product-management]
+        M3[Module module-sample]
+    end
+    subgraph Client repo
+        E[Extension client-x]
+    end
+    C -->|init deps| M1 & M2 & M3
+    C -->|init deps| E
+    E -.->|slot / route override / service wrapper| C
+```
+
+Key takeaway: **the container calls, modules and extensions register**. At boot, the container creates one `deps` object holding 13 services — `config`, `logger`, `api`, `apiRegistry`, `events`, `i18n`, `queryClient`, `toast`, `modal`, `notifications`, `slots`, `routes`, `menu` (`web-container/src/di/deps.ts:23`) — then `discover()` calls `init(deps)` for every module in `config.modules`, and finally for the extension (`web-container/src/bootstrap/discover.ts:12`). Modules and extensions register themselves when the container calls `init(deps)`; the dotted arrow from the extension shows the *adjustment* direction toward what is already registered, not an extra call from the container.
+
+### 3.4 The Boot Flow on One Screen
 
 ```
-┌────────────────────────────────────────────┐
-│  web-extension-client-<x>                    │
-│  - UI override (slot)                      │
-│  - route override                          │
-│  - service wrapper                         │
-│  - client-specific components              │
-└─────────────────┬──────────────────────────┘
-                  │ import public API
-                  ▼
-┌────────────────────────────────────────────┐
-│  web-modules                               │
-│  ┌──────────────────────────────────────┐  │
-│  │ shared/ — UI kit, hooks, utils       │  │
-│  └──────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────┐  │
-│  │ modules/<name>/ — business features  │  │
-│  └──────────────────────────────────────┘  │
-└─────────────────┬──────────────────────────┘
-                  │ import public API
-                  ▼
-┌────────────────────────────────────────────┐
-│  web-container                             │
-│  - shell, DI, auth, routing, layout        │
-│  - instance: queryClient, i18n, store,     │
-│    api, apiRegistry, eventBus, slots,      │
-│    routes, menu, toast, modal              │
-└────────────────────────────────────────────┘
+main.tsx
+  └─ loadConfig()            → fetch /config.json
+  └─ bootstrap(config)       → createDeps + discover
+       ├─ discover()         → init(deps) for each module in config.modules, then the extension
+       └─ createBrowserRouter(...) → build routes from the registry
+  └─ createRoot(...).render(<RouterProvider router={router} />)
 ```
 
-### 4.2 Dependency Matrix
+The order matters: config is read first, `deps` is created **once**, all `init` calls finish, and only then are the router and React rendered. Each step is detailed in §4–§8.
 
-| From \ To | Container | Shared | Module   | Extension |
-| --------- | --------- | ------ | -------- | --------- |
-| Container | —         | ✗      | ✗        | ✗         |
-| Shared    | ✗         | —      | ✗        | ✗         |
-| Module    | ✓ public  | ✓      | ✗        | ✗         |
-| Extension | ✓ public  | ✓      | ✓ public | ✗         |
+### 3.5 Where to Start Reading Code
 
-### 4.3 Public API per Layer
+| To see...                              | Open                                              |
+| -------------------------------------- | ------------------------------------------------- |
+| The app entry point and boot           | `web-container/src/main.tsx:11`                   |
+| The `deps` contract (13 services)      | `web-container/src/di/deps.ts:23`                 |
+| A complete example module              | `web-modules/modules/module-sample/index.tsx:14`  |
+| An example client extension            | `web-extension-client-a/src/index.tsx:32`         |
 
-| Layer     | Public API                              |
-| --------- | --------------------------------------- |
-| Container | `src/public/index.ts`                   |
-| Shared    | `shared/index.ts`                       |
-| Module    | `modules/<name>/public.ts`              |
-| Extension | `src/index.tsx` (default export `init`) |
+### 3.6 One Real Flow
 
-Importing outside the public API is a contract violation.
+An example from this repo — log in as client `client-a`, then browse the app:
+
+| What happens                                   | Who handles it                                                                                                       |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| The "Users" menu item appears                  | The `user-management` module registers the menu; the client-a extension overrides the i18n label to "Client A Users"  |
+| The user list page (`/users`) opens            | A route owned by the `user-management` module; the extension adds an audit button via the `user-management.userTableActions` slot |
+| The user detail page (`/users/:id`) opens      | The route is overridden by the client-a extension → the `ClientAUserDetail` component                                 |
+| The `/module-sample/extension-points` page opens | The route is overridden by the extension; a panel on that page is also filled via the `module-sample.overviewPanel` slot |
+
+Everything the client "added" happens without changing module code. That is the payoff of this architecture.
+
+Next: §4–§8 covers the boot sequence, the `deps` contract in detail, routing, slots, overrides, and finally build and deployment.
 
 ---
 
-## 5. Boot Sequence
+## 4. Modular Mechanism In Depth
 
-### 5.1 Sequence
+§1–§3 gave the big picture. This part dissects, one by one, the mechanisms modules and extensions use to plug into the container. They all rest on the same pattern: a **registry** — a name → data map object — that the container creates once at boot and hands over through `deps`; modules and extensions register, and the container reads the contents after all init calls finish.
 
-```
-1. main.tsx
-   ├─ loadConfig()              → fetch /config.json
-   ├─ setConfig(config)         → set into container config
-   └─ bootstrap()
+### 4.1 Discovery & Loader Map
 
-2. bootstrap()
-   ├─ discover()
-   │   ├─ moduleLoaders.generated.ts    → map name → lazy import (result of `npm run gen:modules`)
-   │   ├─ for module in config.modules:
-   │   │   ├─ module.init(deps)         → register service, menu, route, i18n
-   │   │   └─ module.registerModal(deps) → optional
-   │   └─ initExtension(deps)           → register slot, override route, event
-   └─ createBrowserRouter(routeRegistry.getRoutes())
-
-3. ReactDOM.createRoot().render()
-   └─ <RouterProvider router={router} />
-```
-
-### 5.2 What Happens in `init(deps)`
-
-Every module and extension has an `init(deps)` hook that is called **once** at boot.
-
-**Module `init`:**
+*Discovery* means the container finds modules from runtime data (`config.modules`), not from a hardcoded list of `import`s. Between a module name and its code sits a **loader map** of dynamic imports:
 
 ```ts
-async init(deps) {
-  // 1. Register service
-  deps.apiRegistry.register('user', axios.create({ baseURL: '/api/user' }));
-
-  // 2. Register menu
-  deps.menu.register({ path: '/users', label: 'Users', order: 10 });
-
-  // 3. Register route
-  deps.routes.add({ path: '/users', element: <UserTable /> });
-
-  // 4. Register i18n
-  deps.i18n.addResourceBundle('en', 'user-management', en);
-
-  // 5. Listen event (optional)
-  deps.events.on('user.created', (payload) => { /* ... */ });
-}
-```
-
-**Extension `init`:**
-
-```ts
-export default async function init(deps) {
-  // 1. Fill slot
-  deps.slots.register('user-management.userTableActions', AuditButton);
-
-  // 2. Override route
-  deps.routes.override('/users/:id', { element: <ClientAUserDetail /> });
-
-  // 3. Register new service (optional)
-  deps.apiRegistry.register('client-a.audit', axios.create({ baseURL: '/api/audit' }));
-
-  // 4. Listen to module event
-  deps.events.on('user-management.user.updated', (payload) => { /* ... */ });
-}
-```
-
-### 5.3 Idempotency
-
-`init` may be called twice in React 19 StrictMode. Modules must be idempotent:
-
-- `slots.register` → throws on duplicate. Wrap with a guard or make it idempotent.
-- `routes.add` → throws on duplicate. Same.
-- `apiRegistry.register` → throws on duplicate. Same.
-
-**Solution:** the container provides an `isInitialized` flag. Or modules check `if (deps.slots.has(name)) return;`.
-
----
-
-## 6. Configuration
-
-### 6.1 Config Source
-
-| Environment | Source                                                  |
-| ----------- | ------------------------------------------------------- |
-| Local dev   | `web-container/public/config.json`                      |
-| Production  | `/config.json` generated by the entrypoint from env vars |
-
-### 6.2 Config Structure
-
-```json
-{
-  "client": "client-a",
-  "modules": ["user-management", "product-management"],
-  "apiBase": "https://dummyjson.com",
-  "featureFlags": {
-    "enableAuditLive": true
-  }
-}
-```
-
-### 6.3 Load Config
-
-```ts
-// main.tsx
-async function main() {
-  const config = await loadConfig();
-  setConfig(config);
-  const router = await bootstrap();
-  ReactDOM.createRoot(...).render(<RouterProvider router={router} />);
-}
-```
-
-### 6.4 Rules
-
-- The container **must** load config before bootstrap.
-- Modules and extensions **must not** access `import.meta.env` directly.
-- Modules and extensions access config via `deps.config` or `useConfig()`.
-- Config **must** be fetched with `cache: 'no-store'`.
-- Config **must** have a default fallback so the app can boot when the fetch fails.
-
-### 6.5 Runtime vs Build-time
-
-| Aspect       | Build-time (`import.meta.env`) | Runtime (`/config.json`) |
-| ------------ | ------------------------------ | ------------------------ |
-| When set     | Build                          | Container start          |
-| Image        | Per environment                | One for all              |
-| Change URL   | Rebuild                        | Restart container        |
-| CI variable  | Before build                   | After build (deploy)     |
-
-**Choice:** runtime config. One image, many environments.
-
----
-
-## 7. Dependency Injection — deps + hooks
-
-### 7.1 Concept
-
-The container provides instances via two channels:
-
-| Channel       | When used                            |
-| ------------- | ------------------------------------ |
-| `deps` object | In `init(deps)` — outside React tree |
-| React hooks   | In components — inside React tree    |
-
-Both point to the same instance.
-
-### 7.2 Contents of `deps`
-
-```ts
-deps = {
-  config, // AppConfig
-  logger, // Logger
-  api, // Axios default
-  apiRegistry, // Service registry
-  events, // Event bus
-  i18n, // i18next instance
-  queryClient, // TanStack QueryClient
-  toast, // Toast service
-  modal, // Modal service
-  slots, // Slot registry
-  routes, // Route registry
-  menu, // Menu registry
+// web-container/src/bootstrap/moduleLoaders.generated.ts:12
+export const moduleLoaders: Record<string, () => Promise<ModuleEntryPoint>> = {
+  'module-sample': () => import('@arsi/module-module-sample/entry'),
+  'product-management': () => import('@arsi/module-product-management/entry'),
+  'user-management': () => import('@arsi/module-user-management/entry'),
 };
 ```
 
-### 7.3 Available Hooks
+This file is **generated**: `scripts/generate-module-loaders.mjs` builds it from each module's `package.json` via `npm run gen:modules`; never edit it by hand. The `predev`, `pretypecheck`, `pretest`, and `prebuild` hooks run it automatically (`web-container/package.json:10-23`).
+
+The loop lives in `discover()`:
 
 ```ts
-import {
-  useConfig,
-  useLogger,
-  useApi,
-  useApiRegistry,
-  useEventBus,
-  useTranslation,
-  useQueryClient,
-  useQuery,
-  useMutation,
-  useToast,
-  useModal,
-  useSlot,
-  useAuth,
-  useTheme,
-  useLocale,
-} from "@arsi/container";
-```
-
-### 7.4 When to Use What
-
-| Context                    | Use       |
-| -------------------------- | --------- |
-| `init(deps)`               | `deps`    |
-| Event listener in `init`   | `deps`    |
-| Route definition in `init` | `deps`    |
-| Component body             | hooks     |
-| Custom hook                | hooks     |
-| Utility function           | parameter |
-
-### 7.5 Anti-pattern
-
-```ts
-// ❌ Don't — access deps at module top-level
-import { deps } from "@arsi/container";
-const client = deps.queryClient; // executed when the module loads
-```
-
-```ts
-// ✅ Correct — access inside a function/hook
-function useUsers() {
-  const queryClient = useQueryClient();
-  // ...
+// web-container/src/bootstrap/discover.ts:13
+for (const moduleName of deps.config.modules) {
+  const load = moduleLoaders[moduleName];
+  if (!load) {
+    throw new Error(
+      `[bootstrap] module "${moduleName}" is declared in config.modules but is not wired in moduleLoaders.generated.ts (run \`npm run gen:modules\`)`,
+    );
+  }
+  const entry = await load();
+  await entry.default(deps);
+  deps.logger.info(`module "${moduleName}" initialized`);
 }
+```
+
+Key points:
+
+- Init order follows the order of names in `config.modules`.
+- A name in config with no loader in the map → **fail-fast**: boot stops with a message telling you to run `npm run gen:modules` (`discover.ts:16`). A missing feature due to misconfiguration is better surfaced at boot than discovered silently in production.
+- After all modules, `discover()` loads the extension through the `@arsi/extension` alias (`discover.ts:10`; mapped at build time to `web-container/current-client/src/index.tsx`, `aliases.cjs:21-24`) and calls `extension.default(deps)` (`discover.ts:26`). The extension **always inits last**; this order is what makes route overrides (§4.4) valid.
+
+### 4.2 `deps` — The Single Services Object (DI)
+
+`deps` is the only channel between the container and module/extension code. `createDeps(config)` (`web-container/src/di/deps.ts:39`) creates it once at boot (`web-container/src/bootstrap/index.tsx:19`), then the same object is handed to every `init(deps)`. It holds 13 services (`web-container/src/di/deps.ts:23`):
+
+| Field           | Purpose                                                                             |
+| --------------- | ----------------------------------------------------------------------------------- |
+| `config`        | `AppConfig` produced by `loadConfig()`: `client`, `modules`, `apiBase`, `featureFlags` |
+| `logger`        | Client-prefixed logger; level `debug` in dev, `info` in production                  |
+| `api`           | Base axios instance for the platform backend                                        |
+| `apiRegistry`   | Per-name service registry (§4.5); the core `auth` service is pre-registered         |
+| `events`        | Cross-module event bus (§4.7)                                                       |
+| `i18n`          | i18next instance; `addResourceBundle` registers per-namespace translations          |
+| `queryClient`   | React Query query client                                                            |
+| `toast`         | Toast service (lightweight, self-dismissing notifications)                          |
+| `modal`         | Modal registry + controls (§4.6)                                                    |
+| `notifications` | Persistent notification service                                                     |
+| `slots`         | UI slot registry (§4.3)                                                             |
+| `routes`        | Host route registry (§4.4)                                                          |
+| `menu`          | Sidebar menu registry (§4.6)                                                        |
+
+The only registration `createDeps` performs itself is the core `auth` service:
+
+```ts
+// web-container/src/di/deps.ts:45
+apiRegistry.register('auth', createServiceClient('/api/auth'));
+```
+
+Modules and extensions **never** create their own i18n, router, or query client instances — they receive `deps` and register into it.
+
+### 4.3 Slot — UI Extension Point
+
+A **slot** is a named placeholder in the UI that a component from outside the module can fill. Three steps:
+
+**1. The module declares the slot name.** The name lives in `slots.ts` and is exported through `public.ts` so extensions can import it (`web-modules/modules/module-sample/public.ts:8`):
+
+```ts
+// web-modules/modules/module-sample/slots.ts:2
+export const sampleSlots = {
+  overviewPanel: 'module-sample.overviewPanel',
+} as const;
+```
+
+The convention is `<module>.<slot>` so names cannot collide across modules.
+
+**2. The module's component consumes the slot** through the `useSlot` hook from `@arsi/container`:
+
+```tsx
+// web-modules/modules/module-sample/pages/SampleExtensionPage.tsx:11
+const Panel = useSlot<{ label?: string }>(sampleSlots.overviewPanel);
+```
+
+`useSlot` only reads the registry (`web-container/src/hooks/useSlot.ts:5`; exported from `web-container/src/public/index.ts:16`). When nothing has filled the slot yet, it returns `undefined` and the module renders its own fallback (`SampleExtensionPage.tsx:49`).
+
+**3. The extension fills the slot** via `deps.slots.register(name, component)` — e.g. `AuditButton` for `userSlots.userTableActions` (`web-extension-client-a/src/index.tsx:62`) and `ClientASamplePanel` for `sampleSlots.overviewPanel` (`:70`):
+
+```tsx
+// web-extension-client-a/src/index.tsx:70
+deps.slots.register(sampleSlots.overviewPanel, ClientASamplePanel);
+```
+
+A slot may hold only **one** component: a second registration throws `[slots] slot "..." already has a component registered` (`web-container/src/slots/slotRegistry.ts:17`). `get` and `has` (`:21`, `:24`) cover reads. The rule of the game: the module declares, the extension fills, and the module never knows who filled it.
+
+### 4.4 Route — Host Route Registry
+
+Modules register routes via `deps.routes.add({ path, element, meta })`:
+
+```tsx
+// web-modules/modules/module-sample/index.tsx:36
+deps.routes.add({
+  path: '/module-sample',
+  element: <SampleOverviewPage />,
+  meta: { group: 'sample', module: 'module-sample' },
+});
+```
+
+- `meta.module` is **required** — the host uses it to tie a route to its owning module (and `group` for navigation grouping).
+- A duplicate path → error `[routes] route "..." is already registered` (`web-container/src/routes/routeRegistry.ts:27`). Without this rule, two modules could silently overwrite each other's pages.
+- Extensions adjust routes with `override(path, { element, meta })`; this is only allowed for an already-registered path, otherwise → error `[routes] cannot override unknown route "..."` (`routeRegistry.ts:33`).
+
+Because the same extension may be installed for clients with a different subset of modules, it checks with `has(path)` first. The `overrideIfPresent` pattern in client-a:
+
+```tsx
+// web-extension-client-a/src/index.tsx:25
+if (!deps.routes.has(path)) {
+  deps.logger.warn(`[client-a] route "${path}" belum terdaftar; override dilewati`);
+  return;
+}
+deps.routes.override(path, definition);
+```
+
+If the `user-management` module is not in `config.modules`, the `/users/:id` override is skipped with a warning instead of failing boot.
+
+The container builds the router from `getRoutes()` **after** discovery: module routes are attached as children under `/` (behind `ProtectedRoute` + `AppShell`, `web-container/src/bootstrap/index.tsx:28-41`), with the leading slash stripped during mapping (`bootstrap/index.tsx:23`). The full flow is in §5.
+
+**Dynamic routes & query strings.** The registry stores the path **as a string** (`web-container/src/routes/routeRegistry.ts:22-29`); at boot, the container maps every registered path to React Router by stripping the leading `/` and passing it to `createBrowserRouter` (`web-container/src/bootstrap/index.tsx:22-26`).
+
+- React Router v6 matches `:id` dynamic segments natively; static patterns beat dynamic ones. Pages read params via `useParams` — real example: `/users/:id` registered at `web-modules/modules/user-management/index.tsx:42` and read in `web-modules/modules/user-management/pages/UserDetailPage.tsx:12`.
+- `has`/`override` match the **exact string**: an extension overriding a dynamic route writes the same pattern (`'/users/:id'`, e.g. `web-extension-client-a/src/index.tsx:64`), never a concrete URL.
+- Query strings (`/users?state=online`) are never part of registration or route matching. Pages read them with `useSearchParams`, then pass the values to services/React Query keys; there is no example in this sample yet.
+- Deploy: the nginx SPA fallback (`try_files $uri $uri/ /index.html`, `web-container/nginx.conf:18`) serves any deep link, and the browser preserves the query string.
+
+```tsx
+// Dynamic page: params from the path, filters from the query string.
+const { id } = useParams<{ id: string }>();
+const [searchParams] = useSearchParams();
+const state = searchParams.get('state');
+```
+
+### 4.5 Service Registry (`apiRegistry`)
+
+Services with their own client are registered in a named registry so modules never import each other's axios instances. A module registers its own instance:
+
+```ts
+// web-modules/modules/module-sample/index.tsx:23
+const sampleClient = axios.create({
+  baseURL: deps.config.apiBase,
+  timeout: 8000,
+});
+deps.apiRegistry.register('module-sample', sampleClient);
+```
+
+- A module's service name is not always the module name: follow `CONTRACT` §4.6 — `user-management` → `user`, `product-management` → `product`, `module-sample` → `module-sample`.
+- Extension convention: **client name prefix** — `<client>.<service>` — e.g. `deps.apiRegistry.register('client-a.audit', auditClient)` (`web-extension-client-a/src/index.tsx:60`). That makes it impossible for an extension service to collide with a base service.
+- The core `auth` service is registered by the container (`web-container/src/di/deps.ts:45`).
+- Duplicate → error `[apiRegistry] service "..." is already registered` (`web-container/src/api/apiRegistry.ts:15`); `get(name)` throws for an unknown name (`:22`); `has` is available for checks.
+- In components, the registry is read through `useApiRegistry` from `@arsi/container` (`web-container/src/public/index.ts:4`), for example `SampleExtensionPage.tsx:14`.
+
+### 4.6 Menu & Modal
+
+**Menu.** The host sidebar is built from `deps.menu.getAll()`. A module registers one item per main page:
+
+```ts
+// web-modules/modules/module-sample/index.tsx:29
+deps.menu.register({
+  path: '/module-sample',
+  label: 'menu.root',
+  namespace: 'module-sample',
+  order: 30,
+});
+```
+
+`label` is an **i18n key**, not final text; `namespace` points at the translation bundle the module registered in `index.tsx:20`, so labels follow the active language. `getAll()` returns items sorted by `order` ascending (`web-container/src/menu/menuRegistry.ts:23`). A duplicate path → error `[menu] menu item "..." is already registered` (`:19`).
+
+**Modal.** A modal is a React component the host renders when opened, with an arbitrary payload:
+
+```ts
+// web-modules/modules/module-sample/index.tsx:50
+deps.modal.register(sampleModals.info, SampleInfoModal);
+```
+
+`sampleModals.info` equals `'module-sample.info'` (`web-modules/modules/module-sample/modals.ts:2`) — the `<module>.<modal>` convention. A modal component receives `{ payload, close }` props (`web-container/src/modal/modalService.ts:3`); open it via `deps.modal.open(name, payload)` (`:42`) or the `useModal` hook (`web-container/src/public/index.ts:11`). A duplicate name → error `[modal] "..." is already registered` (`modalService.ts:38`).
+
+### 4.7 Event Bus — Communication Without Coupling
+
+`deps.events` is a simple **event bus** (publish–subscribe): a sender calls `emit(name, payload)` and every handler registered via `on(name, handler)` is invoked — neither side knows the other. The implementation is a `Map<string, Set<handler>>` (`web-container/src/events/eventBus.ts:11`); `on` returns an unsubscribe function (`:18`). Inside components, the same bus is reached through the `useEventBus` hook (`web-container/src/public/index.ts:5`), which returns `deps.events` (`web-container/src/hooks/useEventBus.ts:5`).
+
+```tsx
+// web-modules/modules/user-management/hooks/useUser.ts:75 — publisher (emit)
+events.emit(userEvents.updated, { id: user.id, changes: input.changes });
+```
+
+```tsx
+// web-extension-client-a/src/index.tsx:78 — subscriber
+deps.events.on<UserUpdatedPayload>(userEvents.updated, (payload) => {
+  void deps.queryClient.invalidateQueries({ queryKey: userKeys.detail(payload.id) });
+});
+```
+
+Event names are always namespaced (`module-sample.sample.postCreated`, `web-modules/modules/module-sample/events.ts:2`) and payload types are exported through `public.ts`, so the receiving side never needs to know the module's internals. This is the main channel for cross-module actions — e.g. the client-a extension refreshes its React Query cache when the `user-management` module `emit`s `userEvents.updated`. Details in §10.
+
+**Init order at a glance.** This diagram summarizes who calls what:
+
+```mermaid
+sequenceDiagram
+    participant B as bootstrap (container)
+    participant G as moduleLoaders.generated.ts
+    participant M as Module
+    participant D as deps
+    participant X as Extension
+    B->>G: import loader by name from config.modules
+    B->>M: entry.default(deps)
+    M->>D: i18n.addResourceBundle / apiRegistry.register
+    M->>D: menu.register / routes.add / modal.register
+    M->>D: events.on(...)
+    B->>X: extension.default(deps)
+    X->>D: slots.register / routes.override (guard routes.has)
+    X->>D: apiRegistry.register("client-x.audit")
+    Note over B,X: after all init, the container builds the router from routes.getRoutes()
 ```
 
 ---
 
-## 8. State Management
+## 5. End-to-End Boot Sequence
 
-### 8.1 Three Kinds of Store
+Here is the full journey from the browser opening the app to React rendering, in six steps:
 
-| Store     | Owner     | Example             | Persist  |
-| --------- | --------- | ------------------- | -------- |
-| Global    | Container | auth, theme, locale | Yes      |
-| Module    | Module    | `useUserStore`      | Optional |
-| Extension | Extension | `useClientAStore`   | Optional |
+1. **The browser loads the bundle.** `/index.html` and the built JS bundle load; the entry point is `main()` in `web-container/src/main.tsx:11`.
+2. **Config is read.** `loadConfig()` calls `fetch('/config.json', { cache: 'no-store' })` (`web-container/src/config/loadConfig.ts:25`) and normalizes the body into `AppConfig`: `{ client, modules, apiBase, featureFlags }`.
+3. **`deps` is created.** `main.tsx:13` calls `bootstrap(config)`; inside, `createDeps(config)` creates `deps` once (`web-container/src/bootstrap/index.tsx:19`) — including the core `auth` service (`web-container/src/di/deps.ts:45`) — then `discover(deps)` (`:20`).
+4. **Modules & extension init.** `discover()` imports and calls `init(deps)` for each name in `config.modules` in config order, then the extension last (`web-container/src/bootstrap/discover.ts:13-27`). Every registry is filled during this step.
+5. **The router is built.** `bootstrap` maps `deps.routes.getRoutes()` into `RouteObject`s, attaches them as children under `/` (behind `ProtectedRoute` + `AppShell`), then adds `/login`, the `HomePage` index, and the `*` `NotFoundPage` fallback (`bootstrap/index.tsx:22-41`).
+6. **Render.** `main.tsx:20` runs `createRoot(...).render(<AppProviders deps={deps}><RouterProvider router={router} /></AppProviders>)`. `AppProviders` exposes `deps` through React context — the origin of every hook such as `useSlot` — and the router shows the login page or a module page according to auth state.
 
-### 8.2 Zustand Pattern
-
-**Module:**
-
-```ts
-// modules/user-management/store/useUserStore.ts
-import { create } from "zustand";
-
-export const useUserStore = create((set) => ({
-  selectedId: null,
-  select: (id) => set({ selectedId: id }),
-}));
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant MN as main.tsx
+    participant LC as loadConfig()
+    participant BS as bootstrap()
+    participant DS as discover()
+    participant R as Router + React
+    U->>MN: load /index.html + bundle
+    MN->>LC: fetch("/config.json", {cache: "no-store"})
+    LC-->>MN: AppConfig {client, modules, apiBase, featureFlags}
+    MN->>BS: bootstrap(config)
+    BS->>BS: createDeps(config)
+    BS->>DS: discover(deps)
+    DS->>DS: init modules (config.modules) then extension
+    DS-->>BS: registries filled
+    BS->>R: createBrowserRouter(routes.getRoutes())
+    R-->>U: render AppShell (login / module page)
 ```
 
-**Export in the public API:**
+**Three things to underline.**
 
-```ts
-// modules/user-management/public.ts
-export { useUserStore } from "./store/useUserStore";
-```
-
-**Extension uses it:**
-
-```ts
-import { useUserStore } from "@arsi/module-user-management";
-
-function ClientAComponent() {
-  const selectedId = useUserStore((s) => s.selectedId);
-}
-```
-
-### 8.3 Rules
-
-- Each module **must** have its own store for module state.
-- Modules **must not** access another module's store.
-- Cross-module communication goes through the **event bus**, not a shared store.
-- Extensions **may** access the global store via container hooks.
-- Extensions **may** access a module store via hooks exposed by the module.
-- Persist keys **must** be namespaced: `<layer>:<name>`.
-
-### 8.4 When to Use Zustand vs React Query
-
-| Data                                 | Use                           |
-| ------------------------------------ | ----------------------------- |
-| Server data (list, detail)           | React Query                   |
-| UI state (modal open, selected item) | Zustand                       |
-| Form state                           | Local state / react-hook-form |
-| Auth, theme, locale                  | Zustand global                |
-| Session data                         | Zustand + persist             |
-
-**Rule:** if the data comes from an API, use React Query. If it is purely UI state, use Zustand.
+- **Failed config → fallback, not a crash.** If `fetch` fails (missing file, network trouble, invalid JSON), `loadConfig` logs a warning and uses `DEFAULT_CONFIG`: `{ client: 'default', modules: [], apiBase: '', featureFlags: {} }` (`web-container/src/config/loadConfig.ts:31`, `web-container/src/config/types.ts:8`). The app still boots as a shell without modules. Fail-fast applies to *wiring* mistakes in code, not to runtime config that may be absent in some environment.
+- **Bad wiring → fail-fast.** Boot stops with a clear message for: a module not wired in the loader map (`discover.ts:16`), a duplicate route (`routeRegistry.ts:27`), an override of an unknown route (`routeRegistry.ts:33`), and duplicate slot/service/menu/modal (`slotRegistry.ts:17`, `apiRegistry.ts:15`, `menuRegistry.ts:19`, `modalService.ts:38`).
+- **The extension is always last.** Because every module finishes init first, module routes already exist when the extension overrides them — this order is what makes overrides valid. `bootstrap` also memoizes its promise (`bootstrap/index.tsx:46-52`), so `deps` and the router are created only once per page load.
 
 ---
 
-## 9. Data Fetching
+## 6. Config & Runtime Behavior
 
-### 9.1 Division of Responsibility
+§5 already showed `loadConfig()` reading `/config.json` at boot. This section explains **where that file's content comes from** — the dev server or a container entrypoint (the script run automatically when the container starts) — and the winning order when several sources are set at once. Config here is **runtime**, not build-time: the same bundle can run in different environments just by changing env vars at start.
 
-| Layer       | Responsibility                         |
-| ----------- | -------------------------------------- |
-| Axios       | HTTP request, interceptor, auth header |
-| React Query | Cache, stale, loading/error state      |
-| Service     | Combination of axios + business logic  |
-| Hook        | Wrap service with React Query          |
+### 6.1 The `AppConfig` Shape
 
-### 9.2 Service Pattern
+A valid `/config.json` body is normalized into `AppConfig` (`web-container/src/config/types.ts:1`):
 
-A service **must** be a factory function that receives an axios instance:
+| Field          | Contents                                                 | Used for                                          |
+| -------------- | -------------------------------------------------------- | ------------------------------------------------- |
+| `client`       | Client name                                              | Logger message prefix; client identity at runtime |
+| `modules`      | List of active module names                              | Discovery: its order sets init order (§4.1)       |
+| `apiBase`      | Backend base URL                                         | Module HTTP services (`axios`, §4.5)              |
+| `featureFlags` | Optional runtime boolean flags, e.g. `enableAuditLive`   | Toggle features without a rebuild                 |
 
-```ts
-// modules/user-management/services/service.user.ts
-import type { AxiosInstance } from "axios";
+Normalization (`normalizeConfig`, `web-container/src/config/loadConfig.ts:3`) enforces types: a field of the wrong type is replaced with its default (`client: 'default'`, `modules: []`, `apiBase: ''`, `featureFlags: {}`, `types.ts:8`). If `fetch` fails entirely, `loadConfig` uses `DEFAULT_CONFIG` and the app boots as a module-less shell (details in §5).
 
-export function createUserService(api: AxiosInstance) {
-  return {
-    async list({ limit = 10, skip = 0 } = {}) {
-      const res = await api.get("/users", { params: { limit, skip } });
-      return res.data;
-    },
-    async getById(id: string | number) {
-      const res = await api.get(`/users/${id}`);
-      return res.data;
-    },
-  };
+Modules and extensions **must not** read env vars or fetch `/config.json` themselves; everything goes through `deps.config` / `useConfig()` (`CONTRACT` §14.3).
+
+### 6.2 Dev: the Dev Server Generates `/config.json`
+
+When `npm run dev` runs in `web-container`, the `devConfigPlugin` (apply `serve`, `web-container/vite.config.ts:22`) intercepts requests for `/config.json`, including the browser's request at boot. Env comes from `.env` files plus the process environment (`loadEnv(mode, rootDir, '')`, `:24`), and the response is always `Cache-Control: no-store` (`:41`).
+
+Winning order, strongest first:
+
+1. **`VITE_CONFIG_JSON` — full override.** The whole config comes from this env value; other individual envs are ignored. It must be a JSON object (starts with `{`, ends with `}`); otherwise the dev server responds HTTP 500 with `[dev-config] VITE_CONFIG_JSON must be a JSON object (start with '{' and end with '}')` (`web-container/scripts/dev-config.mjs:34-38`).
+2. **Individual env vars** — override fields on top of the base:
+   - `VITE_MODULES` — a CSV (comma-separated list) that **replaces** the whole module list (`dev-config.mjs:55`);
+   - `VITE_API_BASE` — replaces `apiBase` (`:56`);
+   - `VITE_ENABLE_AUDIT_LIVE` — sets `featureFlags.enableAuditLive`; `false` turns it off, any other non-empty value turns it on (`:60`).
+3. **`public/config.json`** — the committed base; fields not overridden by env are taken as-is. In this repo it holds `client-a` + three modules (`web-container/public/config.json:1`).
+4. **Defaults** — used when the base is missing or a field is empty: modules `['user-management']`, apiBase `https://dummyjson.com` (`dev-config.mjs:4-5`).
+
+The client id in dev is resolved from the `current-client` symlink or `.env` (`resolveClientId`). When there is no client and `VITE_CONFIG_JSON` is empty too, the dev server serves the raw `public/config.json` (`vite.config.ts:43-50`).
+
+### 6.3 Production: the Container Entrypoint Writes `/config.json`
+
+In production images, `/config.json` is **written at container start** by `entrypoint.sh`, which the runtime image installs as `/docker-entrypoint.d/40-generate-config.sh` (`Dockerfile:40`). The script reads env vars and writes `/usr/share/nginx/html/config.json` — the path can be changed via `CONFIG_FILE` (`web-container/docker/entrypoint.sh:4`).
+
+| Container runtime env    | Effect                                      | Default                 |
+| ------------------------ | ------------------------------------------- | ----------------------- |
+| `VITE_CLIENT`            | `client` field                              | `base`                  |
+| `VITE_MODULES` (CSV)     | `modules` field (joined into a JSON array)  | `user-management`       |
+| `VITE_API_BASE`          | `apiBase` field                             | `https://dummyjson.com` |
+| `VITE_ENABLE_AUDIT_LIVE` | `featureFlags.enableAuditLive`              | `true`                  |
+| `VITE_CONFIG_JSON`       | Full override: config body written verbatim | empty                   |
+
+`VITE_CONFIG_JSON` wins completely: individual envs are ignored (logged, `entrypoint.sh:21`); if the value is not a JSON object → `exit 1` and the container fails to start (`:16-17`).
+
+The consequence is exactly the **one image, many environments** principle (§1.2): changing the API base, module list, or flags is just env at `docker run`, with no rebuild. What is still fixed at image build time is **which client extension is included** (covered in §8); `VITE_CLIENT` only fills the client name in config.
+
+### 6.4 Config Resolution Order
+
+```mermaid
+flowchart TD
+    A[Dev server / entrypoint] --> B{VITE_CONFIG_JSON set?}
+    B -->|yes| C[/config.json = JSON from env/]
+    B -->|no| D{individual envs set?}
+    D -->|yes| E[env overrides fields on the base public/config.json]
+    D -->|no| F[base public/config.json as-is]
+    E --> G[/config.json final/]
+    F --> G
+```
+
+Two runtimes are merged in the diagram: the **dev server** uses `public/config.json` as its base (§6.2), while the **production entrypoint** always rewrites that file from env/defaults (§6.3) — the bundled copy of `public/config.json` is never used as a base. The outcome is the same: one final `/config.json` read by `loadConfig()` at boot.
+
+Two different failure modes: in production, an invalid `VITE_CONFIG_JSON` fails **container start** (fail-fast); in the browser, a config that fails to fetch only falls back to `DEFAULT_CONFIG` and the app still boots (§5).
+
+---
+
+## 7. The 3 Override Levels + Guard
+
+An extension customizes the app without touching container or module code. There are three levels, from safest to most invasive:
+
+| # | Level           | API                                                       | Nature                                                                    | Example in this repo                                                                           |
+| - | --------------- | --------------------------------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 1 | Slot            | `deps.slots.register(name, component)`                    | Additive: only adds a component at an extension point the module provides | `AuditButton` fills `userSlots.userTableActions` (`web-extension-client-a/src/index.tsx:62`)   |
+| 2 | Route override  | `deps.routes.override(path, {element, meta})`             | Replaces the whole route entry                                            | `/users/:id` → `ClientAUserDetail` (`:64`)                                                     |
+| 3 | Service wrapper | `deps.apiRegistry.register('<client>.<service>', client)` | Adds a new client-namespaced service                                      | `client-a.audit` (`:60`)                                                                       |
+
+Jargon: **additive** means it can only add, never remove; **invasive** means it changes already-registered behavior.
+
+- **Level 1 — slot.** A UI extension point declared by a module (§4.3). The safest because it changes nothing that already exists. Its limit: one slot holds only one component — a second registration throws `[slots] slot "..." already has a component registered` (`web-container/src/slots/slotRegistry.ts:17`).
+- **Level 2 — route override.** `override(path, {element, meta})` replaces the **whole entry**, not just the fields you pass; the path itself cannot be changed via override. Pass `meta` again (e.g. `{ group, module }`) so module attribution is not lost. Without a guard, overriding a path that is not registered throws `[routes] cannot override unknown route "<path>"` (`web-container/src/routes/routeRegistry.ts:33`).
+- **Level 3 — service wrapper.** The service registry has no concept of overriding, so an extension registers a **new** name namespaced as `<client>.<service>` (`CONTRACT` §4.5); that makes a collision with a base service impossible. Core services (`auth`, `user`) are registered by the base (`auth` at `web-container/src/di/deps.ts:45`) and **must not** be overridden by extensions. A duplicate name → error `[apiRegistry] service "..." is already registered` (`web-container/src/api/apiRegistry.ts:15`).
+
+### 7.1 Guard for Optional Modules
+
+The same extension may be installed for clients with a different module subset. A route override targets a module route; if that module is not active in `config.modules`, its route never gets registered. A blind `override` would fail boot, so `CONTRACT` §12.4 requires extensions to check `routes.has(path)` first — skip with `logger.warn` when absent — or to guarantee the module is always active.
+
+Init order helps here: the extension always inits **after** every module (§4.1), so the registry is final by the time the guard runs.
+
+The `overrideIfPresent` pattern in client-a:
+
+```tsx
+// web-extension-client-a/src/index.tsx:20
+function overrideIfPresent(
+  deps: Deps,
+  path: string,
+  definition: Parameters<Deps['routes']['override']>[1],
+): void {
+  if (!deps.routes.has(path)) {
+    deps.logger.warn(`[client-a] route "${path}" belum terdaftar; override dilewati`);
+    return;
+  }
+  deps.routes.override(path, definition);
 }
 ```
 
-**Rules:**
+Its usage (`index.tsx:64`, `:73`) follows this shape:
 
-- Services **must not** access `deps` directly.
-- Services **must not** import React.
-- Services **must not** import `@tanstack/react-query`.
-- Services **must** be pure — take parameters, return data.
+```tsx
+overrideIfPresent(deps, '/users/:id', {
+  element: <ClientAUserDetail />,
+  meta: { group: 'user', module: 'user-management' },
+});
+```
 
-### 9.3 Hook Pattern
+```mermaid
+sequenceDiagram
+    participant X as Extension init
+    participant RR as RouteRegistry
+    participant L as Logger
+    X->>RR: has("/module-sample/extension-points")?
+    alt route registered
+        RR-->>X: true
+        X->>RR: override(path, {element, meta})
+    else not registered (module inactive)
+        RR-->>X: false
+        X->>L: warn("override skipped")
+    end
+```
+
+When an override is skipped, the app still runs with the module's default page — only that customization is missing. If boot fails with `[routes] cannot override unknown route`, the cause is usually a typo in the path or a module missing from `config.modules`.
+
+---
+
+## 8. Deploy Model: Base Image + Extension Image
+
+The deploy model follows the two repo kinds from §2: the platform team builds a **base image** once per version, then the client developer builds a **client image** on top. The client repo does **not** check out the base repo — base sources come from the builder image, as noted in §2.2.
+
+### 8.1 Base Image — Multi-Target `Dockerfile`
+
+The root `Dockerfile` has several targets (Docker multi-stage: one Dockerfile with named build stages): **builder** holds the toolchain + sources + `node_modules`, and **runtime** holds nginx + the built assets.
+
+- **`builder` target** (`Dockerfile:5`) — `FROM node:22-alpine`; copies each package's `package.json`/lockfile then `npm ci` (`:18-20`), copies sources (`:22-24`), and writes the base version to `/app/BASE_VERSION` (`:26`). A new module must be added to the `COPY` list here (a reminder comment sits at `:12`).
+- **`runtime` target** (`:35`) — `FROM nginx:1.27-alpine`; copies `dist/base` to `/usr/share/nginx/html`, `nginx.conf`, and the config entrypoint (§6.3) (`:38-41`).
+- **Intermediate `base-app` target** (`:28`) — runs `npm run check:base` then `CLIENT=base npm run build:client`; the base build is validated against itself before entering runtime.
+
+`ci/build-base.sh` builds both targets and applies **tags** (image version labels): `<version>-builder`, `<sha>-builder`, `<version>`, `<sha>` (`ci/build-base.sh:21-31`). The default version comes from `web-container/package.json`, the `sha` from the commit (`:6-7`). With `PUSH=1` all four tags are pushed (`:33-38`); with `VERIFY=1` typecheck/test/lint run before the build (`:10-17`).
+
+### 8.2 Client Image — `FROM` Base Builder & Runtime
+
+`web-extension-client-a/Dockerfile` assembles the client image from the two base images:
+
+1. `FROM ${BASE_BUILDER_IMAGE} AS builder` (`:7`) — `npm ci` for the extension then copy its source to `/app/extension` (`:11-13`).
+2. Symlink `current-client` to the extension (`:15`) — the build-time alias that selects the active extension (§4.1).
+3. Verify the extension: `typecheck`, `test --if-present`, `lint` (`:16`).
+4. `npm run check:base` then `CLIENT=<client> npm run build:client` (`:17-19`) — producing `dist/<client>` inside the builder.
+5. `FROM ${BASE_RUNTIME_IMAGE} AS runtime` (`:21`) — replace the html root with `dist/<client>` (`:24-25`) and set `ENV VITE_CLIENT=<client>` (`:26`).
+
+The key point: there is no `COPY` of modules or base sources from the client repo — they all come from the builder image (`/app/web-container`, `/app/web-modules`, noted in §2.2). The client repo carries only extension code.
+
+`ci/build-client.sh` takes `BASE_VERSION` from `manifest.json:baseVersion` (`:6`), pulls both base images (default `PULL=1`, `:14-17`), builds tagged with the build id (`BUILD_ID`, default git short SHA), and pushes when `PUSH=1` (`:21-30`).
+
+### 8.3 Pinning `baseVersion` & Adopting a New Base
+
+`manifest.json:baseVersion` pins the **exact tag** of the base a client uses (in this repo `0.1.0`, `web-extension-client-a/manifest.json:3`). At client build time, `check:base` compares the manifest value against `/app/BASE_VERSION` in the builder image; a mismatch → error telling you to bump `baseVersion` or use the right base tag (`web-container/scripts/check-base-version.mjs:29-34`). A client build therefore cannot silently use the wrong base.
+
+Adopting a new base = a PR in the client repo bumping `baseVersion`, then rebuilding the client image. There is no base checkout step on the client side.
+
+### 8.4 Build & Runtime Flow
+
+```mermaid
+flowchart LR
+    subgraph Base repo
+        D[Dockerfile multi-target] --> BIMG[builder image]
+        D --> RIMG[runtime image]
+    end
+    subgraph Client repo
+        CD[Dockerfile client] -->|FROM builder| CB[build + verify + build:client]
+        CB -->|FROM runtime| CIMG[client image]
+    end
+    BIMG --> CB
+    RIMG --> CIMG
+    CIMG --> VM[VM / runtime: env → /config.json]
+```
+
+Once the client image exists, it behaves like the base at runtime: the entrypoint writes `/config.json` from env at container start (§6.3), so the same image can serve several environments.
+
+Full operational steps — build, push, run, smoke test — live in `DEPLOYMENT-GUIDE`: **Tutorial A** (deploy on a local laptop), **Tutorial B** (deploy on an Ubuntu server), and **Tutorial C** (deploy via Azure CI/CD).
+
+---
+
+## Part II — Reference
+
+Part I builds the mental model; Part II is a **working reference**: a summary of each mechanism with pointers to its normative rules. The code in this repo is the final word, mandatory rules live in `CONTRACT`, and hands-on steps live in `DEVELOPER-GUIDE`.
+
+## 9. Layers & Dependency Rules
+
+There are four code layers — container, shared, module, extension — and **dependencies may only flow one way, downward**: the extension knows the base, the base never knows the extension or modules directly.
+
+```mermaid
+flowchart TD
+    E[Extension] --> M[Module] & C[Container] & S[Shared]
+    M --> C & S
+    C -.->|discover via config, not import| M
+```
+
+| Rule | Meaning |
+| --- | --- |
+| Container never imports modules/extensions | Modules are discovered from `config.modules` through the loader map (§4.1) |
+| Modules never import other modules | Communicate through the event bus (§10.3); import genuinely public APIs from that module's `public.ts` |
+| Shared never imports container/modules | `@arsi/shared` is pure components/hooks/utils |
+| Container stays self-contained | The container must not import `@arsi/shared`; shell styling uses its own tokens (`CONTRACT` §9.4) |
+| Imports only from public APIs | `@arsi/container`, `@arsi/shared`, and a module's `public.ts` (`CONTRACT` §1.4) |
+
+Full rules and the dependency matrix: `CONTRACT` §1; how to access services outside and inside the React tree: `CONTRACT` §2.
+
+## 10. State, Data Fetching, Events, UI
+
+The six patterns below appear in almost every module. In `init(deps)` use the `deps` object; inside components use hooks from `@arsi/container` (`CONTRACT` §2.1).
+
+### 10.1 Per-module state — Zustand
+
+Each module owns its store for **UI state** (filters, page, selected item); the container owns the global stores (`auth`, `theme`, `locale`). A module store is exported through `public.ts` so extensions may use it — other modules still may not.
 
 ```ts
-// modules/user-management/hooks/useUser.ts
-import { useMemo } from "react";
-import { useQuery, useApi } from "@arsi/container";
-import { createUserService } from "../services/service.user";
-import { userKeys } from "../queryKeys";
+// web-modules/modules/user-management/store/useUserStore.ts:16
+export const useUserStore = create<UserUiState>()(
+  devtools(
+    persist((set) => ({ search: '', page: 1, /* ... */ }), { name: 'module:user-management' }),
+    { name: 'user-management', enabled: isDev },
+  ),
+);
+```
 
-export function useUserList(params?: { limit?: number; skip?: number }) {
-  const api = useApi();
-  const service = useMemo(() => createUserService(api), [api]);
+Persist keys must be namespaced `<layer>:<name>`. Full rules: `CONTRACT` §3.
+
+### 10.2 Data fetching — React Query + service factory
+
+API data → React Query; pure UI state → Zustand. A service must be a *factory function* — it takes an axios instance and returns the service object — so it never touches `deps` and is easy to test.
+
+```ts
+// web-modules/modules/user-management/hooks/useUser.ts:17-29
+function useUserService() {
+  const apiRegistry = useApiRegistry();
+  return useMemo(() => createUserService(apiRegistry.get('user')), [apiRegistry]);
+}
+
+export function useUserList(params?: UserListParams) {
+  const service = useUserService();
 
   return useQuery({
     queryKey: userKeys.list(params),
@@ -590,969 +725,159 @@ export function useUserList(params?: { limit?: number; skip?: number }) {
 }
 ```
 
-### 9.4 Query Key Factory
+Per-module query keys live in `queryKeys.ts`, are namespaced, and are exported through `public.ts` so extensions can invalidate the cache. Only the container creates the `QueryClient`; every mutation invalidates the relevant keys. Full rules: `CONTRACT` §5.
+
+### 10.3 Event bus — cross-module communication
+
+Senders call `emit(name, payload)`; listeners register with `on(name, handler)`, and neither side knows the other. Event names are namespaced `<module>.<entity>.<action>`; payload types are exported through `public.ts`.
 
 ```ts
-// modules/user-management/queryKeys.ts
-export const userKeys = {
-  all: ["user-management", "user"] as const,
-  list: (params?: any) => [...userKeys.all, "list", params] as const,
-  detail: (id: string | number) => [...userKeys.all, "detail", id] as const,
-};
-```
-
-Export it in `public.ts` so extensions can invalidate:
-
-```ts
-export { userKeys } from "./queryKeys";
-```
-
-### 9.5 Mutation
-
-```ts
-export function useCreateUser() {
-  const api = useApi();
-  const service = useMemo(() => createUserService(api), [api]);
-  const queryClient = useQueryClient();
-  const toast = useToast();
-  const { t } = useTranslation("user-management");
-
-  return useMutation({
-    mutationFn: (input: CreateUserInput) => service.create(input),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: userKeys.all });
-      toast.success(t("create.success"));
-    },
-    onError: () => toast.error(t("create.error")),
-  });
-}
-```
-
-### 9.6 QueryClient
-
-The container initializes `queryClient` and renders `QueryClientProvider` at the root. Modules and extensions **must not** create their own `QueryClient`.
-
-### 9.7 Rules
-
-- Modules **must not** import `axios` directly (except to register services in `init`).
-- Modules **may** import `useQuery`, `useMutation`, `useQueryClient` from the container.
-- Query keys **must** use a factory, namespaced.
-- Query key factories **must** be exported in `public.ts` if extensions need to invalidate.
-
----
-
-## 10. Service Registry
-
-### 10.1 Concept
-
-The container provides:
-
-- **`deps.api`** — default axios instance, without a specific baseURL.
-- **`deps.apiRegistry`** — registry for services with different configs.
-
-### 10.2 Register Service
-
-```ts
-// modules/user-management/index.ts
-async function init(deps) {
-  const userClient = axios.create({
-    baseURL: "/api/user",
-    timeout: 8000,
-  });
-  deps.apiRegistry.register("user", userClient);
-}
-```
-
-Extension registers a new service:
-
-```ts
-// web-extension-client-a/src/index.tsx
-async function init(deps) {
-  const auditClient = axios.create({
-    baseURL: "/api/audit-client-a",
-    timeout: 5000,
-  });
-  deps.apiRegistry.register("client-a.audit", auditClient);
-}
-```
-
-### 10.3 Use Service
-
-```ts
-// In init
-const user = await deps.apiRegistry.get("user").get("/users/1");
-
-// In a component
-const apiRegistry = useApiRegistry();
-const user = await apiRegistry.get("user").get("/users/1");
-```
-
-### 10.4 Rules
-
-- Service names **must** be unique. Duplicate → throw.
-- Service names **must** be namespaced: `<module>` or `<client>.<service>`.
-- Core services (`auth`, `user`) **must** be registered in the base.
-- Extensions **must not** override core services.
-- Registration **must** happen in `init(deps)`, not at top-level.
-- Services **must** use path-based URLs (`/api/<service>`), not full domains.
-
-### 10.5 When to Use `api` vs `apiRegistry`
-
-| Need                               | Use                |
-| ---------------------------------- | ------------------ |
-| Simple endpoint, one baseURL       | `deps.api`         |
-| Service with a different baseURL   | `deps.apiRegistry` |
-| Service with a different config    | `deps.apiRegistry` |
-| Service registered by an extension | `deps.apiRegistry` |
-
----
-
-## 11. UI Kit & Shared Components
-
-### 11.1 shadcn-ui in `web-modules/shared`
-
-- shadcn-ui primitives: `shared/components/ui/`
-- Composite components: `shared/components/composite/`
-- Public API: `shared/index.ts`
-
-### 11.2 Tailwind & Brand Tokens
-
-- Preset: `web-modules/shared/tailwind.preset.cjs`
-- Config: `web-container/tailwind.config.cjs` extends the preset
-- CSS variables: `web-container/src/styles/globals.css`
-- ARSI Purple brand token (`#551AB9`) + semantic tokens + usage rules: see CONTRACT §10.4.
-- The `Card` component is available in `shared/components/ui/card.tsx` for modules/extensions. The container remains self-contained (does not import `@arsi/shared`).
-
-### 11.3 Add a New Component
-
-```bash
-cd web-modules/shared
-npx shadcn@latest add <component>
-```
-
-The component is automatically placed in `components/ui/`.
-
-### 11.4 Rules
-
-- Modules **must** use components from `@arsi/shared`.
-- Modules **must not** import shadcn-ui directly from `components/ui/...`.
-- Extensions **must** use components from `@arsi/shared`.
-- If you need a new component, **add it to shared**, don't create it in a module.
-- Highly module-specific components (`UserTable`) may live in the module.
-- Theme (colors, radius) lives in the container CSS variables.
-- Modules and extensions **must not** define their own Tailwind config.
-
----
-
-## 12. Override Mechanisms
-
-Extensions can override modules at three levels. Pick the lightest one.
-
-### 12.1 Level 1 — Slot (lightest)
-
-The module exposes a slot, the extension fills it.
-
-**Module defines:**
-
-```ts
-// modules/user-management/slots.ts
-export const userSlots = {
-  userTableActions: "user-management.userTableActions",
-  userDetailSidebar: "user-management.userDetailSidebar",
-};
-```
-
-**Module uses:**
-
-```tsx
-import { useSlot } from "@arsi/container";
-
-function UserTable() {
-  const ExtraActions = useSlot(userSlots.userTableActions);
-  return (
-    <>
-      {/* ... */}
-      {ExtraActions && <ExtraActions user={row} />}
-    </>
-  );
-}
-```
-
-**Extension fills:**
-
-```ts
-deps.slots.register(userSlots.userTableActions, AuditButton);
-```
-
-**When to use:** add UI without changing the module.
-
-### 12.2 Level 2 — Route Override (medium)
-
-The extension replaces a full page.
-
-```ts
-deps.routes.override('/users/:id', {
-  element: <ClientAUserDetail />,
+// module sends
+events.emit(userEvents.updated, { id, changes });
+// extension listens (registered in init)
+deps.events.on<UserUpdatedPayload>(userEvents.updated, (payload) => {
+  void deps.queryClient.invalidateQueries({ queryKey: userKeys.detail(payload.id) });
 });
 ```
 
-**When to use:** replace a full page, change the navigation flow.
+Modules must not listen to extension events. Full rules: `CONTRACT` §13.
 
-### 12.3 Level 3 — Service Wrapper (heaviest)
+### 10.4 i18n — one namespace per module
 
-The extension replaces logic with a wrapper.
-
-```ts
-import { createUserService } from "@arsi/module-user-management";
-
-const base = createUserService(api);
-const wrapped = {
-  ...base,
-  updateUser: async (id, patch) => {
-    if (!patch.email.endsWith("@client-a.com")) {
-      throw new Error("Email must use the client-a domain");
-    }
-    return base.updateUser(id, patch);
-  },
-};
-```
-
-**When to use:** change business rules, add validation, side effects.
-
-### 12.4 Decision Table
-
-| Need                    | Level           |
-| ----------------------- | --------------- |
-| Add a column to a table | Slot            |
-| Replace a button        | Slot            |
-| Replace a full page     | Route           |
-| Add a new route         | Route           |
-| Change validation       | Service wrapper |
-
-A living example of all three levels: `module-sample` + `web-extension-client-a` (see DEVELOPER-GUIDE §4.3–§4.5).
-| Add a side effect       | Service wrapper |
-| Change a business rule  | Service wrapper |
-
-**Rule:** always try slot first. If that doesn't work, route. If that doesn't work, service. Don't jump straight to a service wrapper.
-
-### 12.5 Naming Rules
-
-- Slot name: `<module>.<slotName>` — `user-management.userTableActions`
-- Modal name: `<module>.<action>` — `user-management.create`
-- Event name: `<module>.<entity>.<action>` — `user-management.user.updated`
-
----
-
-## 13. i18n, Toast, Modal
-
-### 13.1 i18n
-
-**Namespace convention:**
-
-| Layer     | Namespace                  |
-| --------- | -------------------------- |
-| Container | `common`, `auth`, `errors` |
-| Module    | `<module-name>`            |
-| Extension | `<module-name>` (override) |
-
-**Module registers:**
+Each module registers its `en`/`id` bundles under its own namespace; extensions may override a module bundle with a *deep merge* (matching keys are overwritten, the rest kept) but not the container's built-in namespaces without agreement. UI text always uses i18n keys, never hardcoded strings.
 
 ```ts
-deps.i18n.addResourceBundle("en", "user-management", en);
-deps.i18n.addResourceBundle("id", "user-management", id);
+deps.i18n.addResourceBundle('en', 'user-management', en);
+const { t } = useTranslation('user-management');
 ```
 
-**Extension overrides:**
+Full rules: `CONTRACT` §6.
+
+### 10.5 Toast, modal, notifications
+
+Three feedback channels owned by the container: `toast` (transient messages), `modal` (dialogs that receive `{ payload, close }`), and `notifications` (the persistent bell in the Topbar). Modal names are namespaced `<module>.<action>` and registered in `init`, not in a component.
 
 ```ts
-deps.i18n.addResourceBundle(
-  "en",
-  "user-management",
-  {
-    title: "Client A Users",
-  },
-  true,
-  true,
-); // deep merge, overwrite
+deps.modal.register(sampleModals.info, SampleInfoModal);
+deps.modal.open(sampleModals.info, payload);
+toast.success(t('create.success')); // from useToast()
 ```
 
-**Use in a component:**
+Full rules: `CONTRACT` §7–§8.
 
-```tsx
-const { t } = useTranslation("user-management");
-return <h1>{t("title")}</h1>;
-```
+### 10.6 UI kit & styling
 
-**Rules:**
-
-- Namespaces **must** be unique per module.
-- Extensions **may** override a module's namespace.
-- Extensions **must not** override the `common` namespace unless agreed upon.
-- Translation keys **must** be descriptive.
-
-### 13.2 Toast — Sonner
-
-**Default:**
-
-```ts
-deps.toast.success('User created');
-deps.toast.error('Failed');
-deps.toast.info('Loading...');
-deps.toast.custom(<CustomToast />);
-```
-
-**Custom per module:** use `toast.custom()` to render your own component.
-
-**Rules:**
-
-- Toasts **must** use `deps.toast` or `useToast`, not `sonner` directly.
-- Toast messages **must** use i18n, not be hardcoded.
-
-### 13.3 Modal — Dialog
-
-**Register:**
-
-```ts
-deps.modal.register("user-management.create", CreateUserDialog);
-```
-
-**Open:**
-
-```ts
-deps.modal.open("user-management.create", { onSuccess: () => {} });
-// or
-const modal = useModal();
-modal.open("user-management.create", { onSuccess: () => {} });
-```
-
-**Rules:**
-
-- Modal names **must** be namespaced: `<module>.<action>`.
-- Modals **must** be registered in `init`, not in a component.
-- Extensions **may** register modals under their own names.
-- Extensions **may** override a module's modal by registering again (must be agreed upon).
-
----
-
-## 14. Event Bus
-
-### 14.1 Concept
-
-Event bus for cross-module communication. The container doesn't know who is listening.
-
-### 14.2 Pattern
-
-**Module emits:**
-
-```ts
-deps.events.emit("user-management.user.updated", { id, changes });
-```
-
-**Extension listens:**
-
-```ts
-deps.events.on("user-management.user.updated", (payload) => {
-  deps.logger.info("user updated", payload);
-});
-```
-
-**In a component:**
-
-```tsx
-const events = useEventBus();
-events.emit("client-a.audit.requested", { userId });
-```
-
-### 14.3 Naming Convention
-
-| Layer     | Format                       | Example                        |
-| --------- | ---------------------------- | ------------------------------ |
-| Module    | `<module>.<entity>.<action>` | `user-management.user.updated` |
-| Extension | `<client>.<entity>.<action>` | `client-a.audit.requested`     |
-
-### 14.4 Rules
-
-- Event names **must** be namespaced.
-- Modules **may** emit events that have no listeners.
-- Extensions **may** listen to module events.
-- Modules **must not** listen to extension events.
-- The base **must not** depend on extension events.
-
----
-
-## 15. Path Mapping & Aliases
-
-### 15.1 Alias Convention
-
-| Alias                             | Resolves to                                     |
-| --------------------------------- | ----------------------------------------------- |
-| `@arsi/container`                 | `web-container/src/public`                      |
-| `@arsi/shared`                    | `web-modules/shared`                            |
-| `@arsi/module-*` (wildcard)       | `web-modules/modules/*/public.ts` (extension)   |
-| `@arsi/module-*/entry` (wildcard) | `web-modules/modules/*/index.tsx` (container)   |
-| `@arsi/extension`                 | `web-container/current-client/src`              |
-
-### 15.2 Wildcard Alias + Generated Loader Map
-
-- `@arsi/module-<name>` → `public.ts` (contract, for extensions) — wildcard, no need to add one per module.
-- `@arsi/module-<name>/entry` → `index.tsx` (container entry) — used **only** by `moduleLoaders.generated.ts`, which is generated from the `package.json` `name`.
-- The `/entry` pattern must come above the base pattern (Vite & TypeScript pick the first matching pattern).
-
-### 15.3 Single Source of Truth
-
-`aliases.cjs` in each repo. Used by:
-
-- `vite.config.ts` → `resolve.alias`
-- `.eslintrc.cjs` → `settings.import/resolver.typescript` (reads `paths` from tsconfig)
-- `tsconfig.json` → `paths` (manual, cannot import `.cjs`)
-
-### 15.4 `current-client` Symlink
-
-**Local dev** — the container has a symlink:
-
-```
-web-container/current-client → ../web-extension-client-<x>
-```
-
-Switch client:
+Shared UI components live in `web-modules/shared` and are imported from `@arsi/shared`; modules/extensions must not import `components/ui/*` directly or create their own Tailwind config. Components that are very module-specific may stay in the module. The container is **self-contained**: it does not import `@arsi/shared` and uses its own color tokens (ARSI Purple `#551AB9` in CSS variables). Adding a component:
 
 ```bash
-CLIENT=client-a npm run link:client   # symlink -> ../web-extension-client-a
-CLIENT=client-b npm run link:client   # symlink -> ../web-extension-client-b
+cd web-modules/shared && npx shadcn@latest add <component>
 ```
 
-**In the builder image** — the extension repo is always COPYed to `/app/extension` (not `web-extension-client-<x>`), then `web-container/current-client → ../extension` is created at build time. That keeps the `@arsi/extension` alias and all other path mappings valid with no changes.
+Full rules: `CONTRACT` §9–§10.
 
-### 15.5 Rules
+## 11. Path Mapping & Aliases
 
-- Aliases **must** resemble package names (`@arsi/module-user-management`), not simple aliases (`@modules/user`).
-- Modules **must not** import other modules.
-- Extensions **must not** import a module's internals.
-- `current-client` **must** be a symlink, not a copy.
+Cross-package imports use aliases instead of relative paths. Two definitions must stay in sync: `web-container/aliases.cjs` (used by Vite) and `web-container/tsconfig.json:paths` (used by TypeScript/ESLint, since tsconfig cannot read `.cjs`).
 
----
+| Alias | Resolves to | Used by |
+| --- | --- | --- |
+| `@arsi/container` | `web-container/src/public/index.ts` | modules & extensions |
+| `@arsi/shared` | `web-modules/shared/index.ts` | modules & extensions |
+| `@arsi/module-*` | `web-modules/modules/*/public.ts` | extensions (module contract) |
+| `@arsi/module-*/entry` | `web-modules/modules/*/index.tsx` | container loader map (§4.1) |
+| `@arsi/extension` | `web-container/current-client/src/index.tsx` | container (active extension) |
 
-## 16. Build & Deployment
+Both `@arsi/module-*` patterns are **wildcards** (a `*` pattern matching any module name): adding a module requires no alias changes. Order matters — the `/entry` pattern is written before the base pattern so the base pattern does not capture it (`aliases.cjs:9-15`). `current-client` is a symlink to the active extension (dev: `CLIENT=client-a npm run link:client`; in the builder image it points to `/app/extension`).
 
-Full step-by-step guide for DevOps (build, run Docker, CI, rollback, smoke test): `DEPLOYMENT-GUIDE.en.md`.
+The loader map `web-container/src/bootstrap/moduleLoaders.generated.ts` is generated by `npm run gen:modules` from each module's `package.json` — never edit it manually (§4.1). Full alias rules: `CONTRACT` §1.5.
 
-### 16.1 Build Locally
+## 12. Build & Deployment (Details)
 
-```bash
-cd web-container
-npm run link:client-a        # symlink current-client -> ../web-extension-client-a
-npm run build:client-a       # output: dist/client-a/
-```
+The base + client image model is in §8; this section covers commands and runtime behavior.
 
-Default base (extension `web-extension-default`, client `base`):
+**Scripts in `web-container/package.json`:**
 
-```bash
-cd web-container
-npm run link:base
-CLIENT=base npm run build:client
-```
+| Script | Purpose |
+| --- | --- |
+| `gen:modules` | regenerate the loader map from `web-modules/modules/*/package.json` |
+| `dev` | dev server; `/config.json` is generated from env (§6.2) |
+| `build` | build using the client from the `current-client` symlink |
+| `build:client` | build for a specific client; env `CLIENT` is **required** (output `dist/<client>`) |
+| `check:base` | compare `manifest.json:baseVersion` with `/app/BASE_VERSION` (§8.3) |
+| `check:dockerfile` | ensure every `package.json` is `COPY`ed in the `Dockerfile` |
+| `test:entrypoint` | test `entrypoint.sh` (`/config.json` writing) |
+| `typecheck`, `test`, `lint` | standard verification before a PR |
 
-### 16.2 Docker
+Pre-hooks `predev`, `prebuild`, `prebuild:client`, `pretypecheck`, `pretest` run `gen:modules` automatically; do not call `vite build` directly or the loader map may go stale.
 
-The base is built **once** from the base repo root: one multi-target `Dockerfile` produces **2 images**; each extension builds **1 client image** `FROM` that base. No pipeline COPYs all 3 repos at once anymore.
+**Root Dockerfile** (multi-target; details in §8.1): `builder` (Node 22 + sources + `node_modules` + `/app/BASE_VERSION`), `base-app` (builds the default `client: base`), `runtime` (nginx 1.27 + `dist/base` + `nginx.conf` + entrypoint). A new module must add its `COPY` line; `check:dockerfile` enforces this.
 
-| Image | Built by | Contents |
-| ----- | -------- | -------- |
-| `<org>/arsi-web-base:<ver>-builder` | `ci/build-base.sh` (`builder` stage, `node:22-alpine`) | base source (`web-container`, `web-modules`, `web-extension-default`) + `node_modules` + `/app/BASE_VERSION` |
-| `<org>/arsi-web-base:<ver>` | `ci/build-base.sh` (`runtime` stage, `nginx:1.27-alpine`) | default SPA (`web-extension-default`) + `nginx.conf` + `entrypoint.sh` |
-| `<org>/arsi-web-<client>:<buildId>` | `ci/build-client.sh` (extension repo) | nginx + client dist (1 image), `ENV VITE_CLIENT=<client>` |
+**Entrypoint & nginx.** On container start, `entrypoint.sh` writes `/config.json` from the `VITE_*` env (§6.3). `nginx.conf` serves the SPA:
 
-```bash
-# Base — from the base repo root
-ORG=<dockerhub-org> VERIFY=1 PUSH=1 ./ci/build-base.sh
+| Location | Behavior | Why |
+| --- | --- | --- |
+| `location = /config.json` | `Cache-Control: no-store` | runtime config must not be cached across deploys |
+| `location /assets/` | `expires 1y` + `public, immutable` | hashed filenames are safe to cache for long |
+| `location /` | `try_files $uri $uri/ /index.html` | SPA deep links fall back to `index.html` |
 
-# Extension — from the extension repo root (base repo is not checked out)
-ORG=<dockerhub-org> PUSH=1 BUILD_ID=$(git rev-parse --short HEAD) ./ci/build-client.sh
-```
+Full operational steps (build, push, run, smoke test, rollback): `DEPLOYMENT-GUIDE` Tutorial A (laptop), Tutorial B (Ubuntu server), Tutorial C (Azure CI/CD).
 
-Extension Dockerfile (abridged):
+## 13. Governance, PR Workflow, Versioning
 
-```dockerfile
-ARG BASE_BUILDER_IMAGE=arsi-web-base:0.0.0-builder
-ARG BASE_RUNTIME_IMAGE=arsi-web-base:0.0.0
-ARG CLIENT_NAME=client
+**Ownership.** The platform team owns the base repo; client developers own the extension repo and **may read** the base without changing it (§2.1). Needs that touch the base are proposed through a PR to the platform team.
 
-FROM ${BASE_BUILDER_IMAGE} AS builder
-COPY package.json package-lock.json /app/extension/
-RUN cd /app/extension && npm ci
-COPY . /app/extension
-RUN cd /app/web-container && ln -sfn ../extension current-client
-RUN cd /app/extension && npm run typecheck && npm run test --if-present && npm run lint
-RUN cd /app/web-container \
-    && npm run check:base \
-    && CLIENT=${CLIENT_NAME} npm run build:client
+**PR flow** (every repo):
 
-FROM ${BASE_RUNTIME_IMAGE} AS runtime
-RUN rm -rf /usr/share/nginx/html
-COPY --from=builder /app/web-container/dist/${CLIENT_NAME} /usr/share/nginx/html
-ENV VITE_CLIENT=${CLIENT_NAME}
-```
+1. Branch from `main` in the relevant repo; keep the change small.
+2. Run `typecheck`, `test`, `lint` (add `check:dockerfile` when touching modules/Dockerfile).
+3. Open the PR with a description + the `CONTRACT` §20 checklist; CI runs the same verification.
+4. Changes to public APIs, naming conventions, or layer rules **require** lead-dev discussion first (`CONTRACT` §19.2).
+5. Merge after review; the client image is rebuilt by the client pipeline (§8.2).
 
-Key rules:
+**Versioning.** Container, shared, modules, and extensions use semver (the `major.minor.patch` scheme); a breaking change to any public API = **major**. Every extension pins `baseVersion` exactly and declares the modules it uses in `manifest.json`; adopting a new base = a PR bumping `baseVersion` (§8.3). Removing an old public API is breaking too — there is no gradual deprecation mechanism, so never remove an API an extension still uses. Full rules: `CONTRACT` §16 and §19.
 
-- **`check:base`** compares `manifest.json:baseVersion` in the extension repo against `/app/BASE_VERSION` in the builder image; a mismatch fails the build.
-- **The base version is pinned exactly** — tag `<ver>` comes from `web-container/package.json:version`; a client image is never built against `latest`.
-- Extension verification (typecheck/test/lint) runs **inside the builder image**, guaranteed against the same base.
-- Private base image → `docker login` before building an extension.
-- New module in the base repo → add a `COPY` line in the root `Dockerfile` + run `npm run check:dockerfile`.
+## 14. Anti-Patterns
 
-### 16.3 Run Container
+The most common mistakes, with their replacements.
 
-```bash
-docker run -p 8080:80 \
-  -e VITE_CLIENT=client-a \
-  -e VITE_MODULES=user-management,product-management,module-sample \
-  -e VITE_API_BASE=https://staging-api.example.com \
-  -e VITE_ENABLE_AUDIT_LIVE=true \
-  docker.io/<org>/arsi-web-client-a:<tag>
-```
+| ❌ Don't | ✅ Do |
+| --- | --- |
+| A module imports another module | Communicate via the event bus (§10.3) or that module's `public.ts` API |
+| An extension writes `if (client === 'client-a')` in base code | Use slots/overrides in the extension; the base never knows client names |
+| Hardcode backend URLs in code | `deps.api`/services + runtime config (`deps.config`) |
+| Store secrets in `VITE_*` env | Keep secrets in the host's secret manager; image config is public data only |
+| Edit `moduleLoaders.generated.ts` by hand | `npm run gen:modules` (already automatic via pre-hooks) |
+| Call `routes.override` without a `routes.has` guard for optional modules | Check `has` first, skip + `logger.warn` (`CONTRACT` §12.4) |
+| Register services/events/slots at module top level | Register inside `init(deps)` |
+| A service accesses `deps`, React, or React Query | A factory function that takes an axios instance |
+| Module/extension creates its own `QueryClient`, i18n, or toast | Use the container instances |
+| Import `axios`, `sonner`, `i18next`, `components/ui/*` directly | Go through `@arsi/container` and `@arsi/shared` |
+| Read `import.meta.env` or fetch `/config.json` in a module/extension | Use `deps.config` or `useConfig()` |
+| Module/extension defines its own Tailwind config | Add components/utilities to shared |
 
-The base runtime can also run standalone (default extension, client `base`): `docker.io/<org>/arsi-web-base:<ver>`.
+The complete list with rationale: `CONTRACT` §20 and the per-topic anti-pattern subsections in `CONTRACT`.
 
-### 16.4 Deployment Targets
+## 15. Roadmap
 
-| Environment | Image                         | Config Source             |
-| ----------- | ----------------------------- | ------------------------- |
-| Staging     | Client image (`<buildId>`)    | Container env / compose   |
-| Production  | the same image, promoted      | Container env / compose   |
+Items from the old ARCHITECTURE §21 that are **not done yet**; finished ones (phase 1 foundation, `product-management`, public-API contract tests, the client-a override + service wrapper samples, correlation ID) are not repeated here. Order is not a time commitment.
 
-One client image, many environments. Config is injected when the container starts (no rebuild); TLS/reverse proxy is handled by the host. Deployment today is via Docker — see `DEPLOYMENT-GUIDE.en.md` §5–§7 for run/promotion/rollback details.
+**Phase 2 — Scale (in progress)**
 
----
+- ⬜ ESLint boundaries plugin to enforce the dependency direction automatically.
+- ⬜ Keycloak RBAC + DB-driven navigation — plan in `docs/phase.02-rbac-navigation.md`, implementation postponed.
+- ⬜ Centralized error reporting (e.g. Sentry); correlation ID (`X-Request-Id`, `X-Correlation-Id`) already runs in `createApi.ts`.
+- ⬜ Health check endpoint in backend services.
 
-## 17. CI/CD
+**Phase 3 — Production hardening**
 
-### 17.1 Generic Pipeline
+- ⬜ Release train + formal versioning policy (semver already works, release cadence does not).
+- ⬜ Error handling chapter in `CONTRACT`.
+- ⬜ Final Azure pipeline (`azure-pipelines.yml`) for base and client.
+- ⬜ Performance budget (bundle size per module).
 
-There is no platform-specific YAML; any pipeline (Azure DevOps, GitHub Actions, Jenkins) just calls the shell scripts in each repo. Details: `DEPLOYMENT-GUIDE.en.md` §8.
+**Phase 4 — Long-term (evaluation)**
 
-**Base repo** (`web-container` + `web-modules` + `web-extension-default`):
-
-| Step | Command |
-| ---- | ------- |
-| Checkout base repo | `git clone <repo-base>` |
-| Node 22 on the runner (for `VERIFY=1`) | `actions/setup-node@v4` / `NodeTool@0` / etc. |
-| Registry login | `docker login` (token from CI secret) |
-| Build + push 2 base images | `ORG=<org> VERIFY=1 PUSH=1 ./ci/build-base.sh` |
-
-**Extension repo** (`web-extension-client-<x>`):
-
-| Step | Command |
-| ---- | ------- |
-| Checkout extension repo | `git clone <repo-extension-<client>>` |
-| Registry login (private base image) | `docker login` (token from CI secret) |
-| Build + push client image | `ORG=<org> PUSH=1 BUILD_ID=$CI_BUILD_ID ./ci/build-client.sh` |
-| Smoke test | `docker run` the resulting image → `curl -sf localhost:8080/config.json` (+ `/`, deep link) before/after push |
-
-- The extension pipeline **does not** check out the base repo; the build only pulls the base image from the registry.
-- Extension verification (typecheck/test/lint) runs inside the builder image during `ci/build-client.sh`.
-- `check:base` ensures the base in use matches `manifest.json:baseVersion`; a mismatch fails the pipeline.
-- Adopting a new base = a PR in the extension repo bumping `baseVersion` (see §19.4).
-
-### 17.2 Pipeline Structure
-
-| Repo                                                        | Pipeline                                                        |
-| ----------------------------------------------------------- | --------------------------------------------------------------- |
-| `arsi-web-base` (`web-container` + `web-modules` + `web-extension-default` + `web-extension-template`) | Build + test base, publish 2 base images (builder + runtime)     |
-| `arsi-web-client-<x>` (`web-extension-client-<x>`)            | Build + test extension in the builder image, build & push client image |
-| `web-extension-template` (inside the base repo)             | No pipeline                                                     |
-
-### 17.3 Artifacts
-
-- Base repo: builder image (`<ver>-builder`, `<sha>-builder`) + runtime image (`<ver>`, `<sha>`)
-- Extension repo: one Docker client image per client (`<buildId>`)
-- No npm artifact for modules — modules are bundled in the builder image and are built into the client image.
-
----
-
-## 18. Governance
-
-### 18.1 Changes Allowed Without Discussion
-
-- Add a shadcn-ui component in shared.
-- Add a new module.
-- Add a slot in a module.
-- Add a translation.
-- Add a route in a module.
-- Add a service in a module.
-- Add a query key in a module.
-
-### 18.2 Changes Requiring Lead Dev Discussion
-
-- Change a module's public API (breaking).
-- Change the shared public API (breaking).
-- Change the container public API.
-- Change naming conventions.
-- Change layer rules.
-- Add a new layer.
-- Override a module's modal from an extension.
-- Override a core service.
-
-### 18.3 Prohibited
-
-- A module importing another module.
-- An extension importing a module's internals.
-- The container importing a module/extension.
-- A module accessing another module's store.
-- An extension overriding the global store without discussion.
-- A service accessing `deps` directly.
-- A module creating its own `QueryClient`.
-- Registering a service at module top-level.
-
-### 18.4 Review Checklist
-
-Before merging a PR:
-
-- [ ] Imports only from the allowed layer public APIs.
-- [ ] No `deps` access at module top-level.
-- [ ] No direct imports of `sonner`, `i18next`, `axios`.
-- [ ] `@tanstack/react-query` imports limited to `useQuery`, `useMutation`, `useQueryClient`.
-- [ ] No direct imports of `components/ui/...`.
-- [ ] Services are factory functions.
-- [ ] Query keys use a factory, namespaced.
-- [ ] New services are registered in `init(deps)`.
-- [ ] Service names are namespaced and unique.
-- [ ] Services use path-based URLs.
-- [ ] Slot, modal, and event names are namespaced.
-- [ ] Translations use i18n.
-- [ ] Route paths are unique.
-- [ ] No circular dependencies.
-- [ ] Public APIs are updated when there are changes.
-- [ ] Tests are added.
-
----
-
-## 19. Development Workflow
-
-### 19.1 Initial Setup
-
-```bash
-mkdir workspace && cd workspace
-
-git clone <web-container-url>
-git clone <web-modules-url>
-git clone <web-extension-client-a-url>
-
-cd web-container
-ln -sfn ../web-extension-client-a current-client
-npm install
-npm run dev:client-a
-```
-
-### 19.2 Switch Client
-
-**Local dev** (symlink, no Docker):
-
-```bash
-cd web-container
-CLIENT=client-b npm run link:client   # symlink current-client -> ../web-extension-client-b
-# Dev server: add a dev:<client> script in web-container like dev:client-a,
-# then run `npm run dev:<client>`.
-```
-
-Generic scripts: `link:client` and `build:client` (require the `CLIENT` env); there is **no** generic dev script — `dev:<client>` is added per client (example: `dev:client-a`). Details: `DEPLOYMENT-GUIDE.en.md` §3.3.
-
-**Docker/CI** does not use a repo symlink: each extension repo builds its own client image via `ci/build-client.sh` (`FROM` the base image; the extension folder is `/app/extension` and the symlink is created at build time). See §16.2.
-
-### 19.3 Add a New Module
-
-1. Create a folder in `web-modules/modules/<name>/` (folder name = name in `config.modules`).
-2. Create `package.json` (name `@arsi/module-<folder>`), `index.tsx` (default export `init(deps)`), `public.ts`.
-3. Create `routes/`, `services/`, `hooks/`, `components/`, `slots.ts`, `queryKeys.ts`, `i18n/`.
-4. Run `npm run gen:modules` in web-container (automatic via pre-hooks) — the loader map is generated from the `package.json` name; there are **no** edits to `discover.ts`/aliases/tsconfig.
-5. Add `COPY web-modules/modules/<name>/package.json ...` to the Dockerfile + `npm run check:dockerfile`.
-6. Add it to `config.modules` (dev: `public/config.json`; production is managed by CI).
-
-### 19.4 Add a New Client
-
-1. Copy `web-extension-template` from the base repo into a new `arsi-web-client-<x>` repo (checkout: `web-extension-client-<x>`), then make it its own Git repo.
-2. Fill in `manifest.json`: `client` = `client-<x>` (e.g. `client-bca`), `baseVersion` = the current base tag (exact, e.g. `0.1.0`).
-3. Push the repo and connect it to CI; the pipeline calls `ci/build-client.sh` to build & push the client image (`FROM` the base image). **The base repo is not rebuilt** and other clients are unaffected.
-4. Optional local dev:
-
-```bash
-cd web-container
-CLIENT=client-x npm run link:client   # symlink current-client -> ../web-extension-client-x
-# add a dev:<client> script like dev:client-a, then run that script
-```
-
-Full dev commands: `DEPLOYMENT-GUIDE.en.md` §3.3.
-
-### 19.5 Override from an Extension
-
-**Slot:**
-
-```ts
-deps.slots.register("user-management.userTableActions", AuditButton);
-```
-
-**Route:**
-
-```ts
-deps.routes.override('/users/:id', { element: <ClientAUserDetail /> });
-```
-
-**Service wrapper:**
-
-```ts
-const base = createUserService(api);
-const wrapped = {
-  ...base,
-  updateUser: async (id, patch) => {
-    /* ... */
-  },
-};
-```
-
----
-
-## 20. Anti-patterns
-
-### 20.1 Dependency
-
-| ❌                                         | ✅                                                          |
-| ------------------------------------------ | ----------------------------------------------------------- |
-| Container imports modules                 | Container discovers via config                              |
-| Module imports another module              | Go through the event bus                                    |
-| Extension imports a module's internals     | Import from `public.ts`                                     |
-| Shared imports container                   | Shared must be pure                                         |
-| Module installs a lib across trees without dedupe | Add to `resolve.dedupe` + align versions (CONTRACT §1.6) |
-
-### 20.2 State
-
-| ❌                                  | ✅               |
-| ----------------------------------- | ---------------- |
-| Module accesses another module's store | Event bus     |
-| Extension creates its own QueryClient | Use the container |
-| Query keys are not namespaced       | Use a factory    |
-| Service accesses `deps` directly    | Factory function |
-
-### 20.3 UI
-
-| ❌                              | ✅                    |
-| ------------------------------- | --------------------- |
-| Import `components/ui/button`   | Import `@arsi/shared` |
-| Create UI components in a module | Add to shared        |
-| Define Tailwind config in a module | Use the shared preset |
-
-### 20.4 Config
-
-| ❌                                | ✅             |
-| --------------------------------- | -------------- |
-| `import.meta.env` in a module     | `deps.config`  |
-| Hardcoded URLs                    | Runtime config |
-| Config committed for production   | Inject via env |
-
-### 20.5 Init
-
-| ❌                            | ✅                        |
-| ----------------------------- | ------------------------- |
-| Register service at top-level | Register in `init(deps)`  |
-| Subscribe to events at top-level | Subscribe in `init(deps)` |
-| Access `deps` at top-level    | Access in a function body |
-
----
-
-## 21. Roadmap
-
-### 21.1 Phase 1 — Foundation (now)
-
-- ✅ 3 repos + template
-- ✅ Container shell
-- ✅ Pilot module `user-management`
-- ✅ Pilot extension `client-a`
-- ✅ Path mapping
-- ✅ Runtime config
-- ✅ React 19 + shadcn-ui + Zustand + React Query
-
-### 21.2 Phase 2 — Scale
-
-- Second module: `product-management`
-- ESLint boundaries plugin
-- Contract testing
-- Keycloak integration
-- Observability (Sentry + correlation ID)
-- Health check endpoint in services
-
-### 21.3 Phase 3 — Production Hardening
-
-- Monthly release train
-- Formal versioning
-- Error handling section in the contract
-- Route override + service wrapper samples
-- Final CI/CD template
-- Performance budget
-
-### 21.4 Phase 4 — Long-term
-
-- Evaluate Azure Artifacts
-- Migrate from path mapping to package registry
-- Micro-frontend (if needed)
-- Automated contract tests in CI
-- Automated dependency upgrades
-
----
-
-## Appendix A — Folder Structure Reference
-
-### A.1 `web-container`
-
-```
-web-container/
-├── aliases.cjs
-├── current-client/              # symlink
-├── tsconfig.json
-├── vite.config.ts
-├── vitest.config.ts
-├── tailwind.config.cjs
-├── postcss.config.cjs
-├── .eslintrc.cjs
-├── index.html
-├── package.json
-├── CONTRACT.md
-├── nginx.conf
-├── docker/
-│   └── entrypoint.sh
-├── scripts/                     # generate-module-loaders + check-dockerfile-modules
-├── public/
-│   └── config.json
-└── src/
-    ├── main.tsx
-    ├── vite-env.d.ts
-    ├── styles/globals.css
-    ├── bootstrap/
-    ├── auth/
-    ├── api/
-    ├── i18n/
-    ├── query/
-    ├── toast/
-    ├── modal/
-    ├── events/
-    ├── menu/
-    ├── slots/
-    ├── routes/
-    ├── store/
-    ├── theme/
-    ├── layout/
-    └── public/
-```
-
-### A.2 `web-modules`
-
-```
-web-modules/
-├── aliases.cjs
-├── tsconfig.json
-├── package.json
-├── shared/
-│   ├── package.json
-│   ├── components.json
-│   ├── tailwind.preset.cjs
-│   ├── index.ts
-│   ├── lib/utils.ts
-│   ├── components/
-│   │   ├── ui/
-│   │   └── composite/
-│   └── hooks/
-└── modules/
-    ├── user-management/
-    ├── product-management/
-    └── module-sample/           # reference module (12 pages demonstrating dependencies)
-        ├── package.json         # name must be @arsi/module-<folder>
-        ├── index.tsx
-        ├── public.ts
-        ├── slots.ts
-        ├── modals.ts
-        ├── events.ts
-        ├── queryKeys.ts
-        ├── types.ts
-        ├── services/
-        ├── hooks/
-        ├── store/
-        ├── components/
-        ├── pages/
-        └── i18n/
-```
-
-### A.3 `web-extension-client-<x>`
-
-```
-web-extension-client-a/
-├── aliases.cjs
-├── tsconfig.json
-├── package.json
-├── manifest.json               # client + baseVersion (exact pin to the base image)
-├── .eslintrc.cjs
-├── Dockerfile                  # FROM base <ver>-builder → FROM base <ver>
-├── ci/
-│   └── build-client.sh
-└── src/
-    ├── index.tsx
-    ├── components/
-    ├── hooks/
-    ├── i18n/
-    └── overrides/
-        └── user-management/
-```
-
----
-
-## Appendix B — Naming Convention Summary
-
-| Aspect            | Format                               | Example                            |
-| ----------------- | ------------------------------------ | ---------------------------------- |
-| Repo              | kebab-case                           | `web-extension-client-a`           |
-| Module folder     | kebab-case                           | `user-management`                  |
-| Component file    | PascalCase                           | `UserTable.tsx`                    |
-| Hook file         | camelCase `use*`                     | `useUser.ts`                       |
-| Service file      | `service.<name>.ts`                  | `service.user.ts`                  |
-| Store file        | `use<Name>Store.ts`                  | `useUserStore.ts`                  |
-| Query keys file   | `queryKeys.ts`                       | —                                  |
-| Slots file        | `slots.ts`                           | —                                  |
-| Public API file   | `public.ts`                          | —                                  |
-| Route path        | kebab-case                           | `/users/:id`                       |
-| Slot name         | `<module>.<slotName>`                | `user-management.userTableActions` |
-| Modal name        | `<module>.<action>`                  | `user-management.create`           |
-| Event name        | `<module>.<entity>.<action>`         | `user-management.user.updated`     |
-| i18n namespace    | `<module>`                           | `user-management`                  |
-| Service name      | `<module>` or `<client>.<service>`   | `user`, `client-a.audit`           |
-| Query key root    | `[<module>, <entity>]`               | `['user-management', 'user']`      |
-| Store persist key | `<layer>:<name>`                     | `module:user-management`           |
-| Docker image      | `<org>/arsi-web-<client>`            | `<org>/arsi-web-client-a`          |
-
----
-
-## Appendix C — Quick Contract
-
-### Container → Module
-
-- The `deps` bag contains all instances.
-- Available hooks: `useApi`, `useApiRegistry`, `useEventBus`, `useTranslation`, `useQueryClient`, `useToast`, `useModal`, `useSlot`, `useConfig`, `useLogger`, `useAuth`, `useTheme`, `useLocale`.
-
-### Module → Extension
-
-- `public.ts` — components, hooks, services, routes, query keys, slots.
-- Modules **don't know about** extensions.
-
-### Extension → Module
-
-- Import only from `@arsi/module-<name>`.
-- Override via slot, route, service wrapper.
-- Register new services via `deps.apiRegistry.register()`.
-
----
-
-**Document version**: 0.3.0
-**Last updated**: 2026-10-02
-
-**Changelog:**
-
-- **0.3.0** — Build & Deployment (§15.4/§16/§17/§19.2/§19.4) synced with the base image model: multi-target base (2 images: builder + runtime) → extension `FROM` base, `check:base`/`baseVersion`, vendor-neutral CI (`ci/build-base.sh` / `ci/build-client.sh`), Docker Hub registry.
-- **0.2.1** — Deployment sections (§16/§17) synced with the actual Dockerfile & pipeline (workspace-root build context, `check:dockerfile`, Docker as the deployment target); link to `DEPLOYMENT-GUIDE.en.md`.
-- **0.2.0** — Generated loader map (`moduleLoaders.generated.ts` + wildcard aliases), module-sample (reference module), 3-tier extension override (slot → route → service wrapper), and wiring docs sync.
-- **0.1.0** — Initial architecture guide. Covers layer architecture, boot sequence, DI, state management, data fetching, service registry, override mechanisms, build & deployment, CI/CD, governance, and development workflow.
+- ⬜ Migrate from path mapping to a package registry if the module count demands it (including evaluating Azure Artifacts as a candidate registry).
+- ⬜ Automated contract tests in CI for every overridden module.
+- ⬜ Automated dependency upgrade.
+- ⬜ Micro-frontend — only if a real runtime-isolation need appears.

@@ -179,14 +179,14 @@ The pattern never changes: **register, don't build**. A module does not create i
 
 ### Step 3 — Read the extension: `web-extension-client-a/src/index.tsx`
 
-An extension has the same shape (`init(deps)` at `:32`), but its content is *adjustments* to what already exists:
+An extension has the same shape (`init(deps)` at `:33`), but its content is *adjustments* to what already exists:
 
-- `:38-54` — adds/overrides i18n bundles, including the `user-management` menu label "Client A Users".
-- `:56-60` — registers a client-specific service with a client-name prefix: `client-a.audit`.
-- `:62` — fills the user table slot (`userSlots.userTableActions`) with an audit button.
-- `:64-67` — overrides the `/users/:id` route — guarded by `deps.routes.has` so it stays safe when the module is absent.
-- `:70` — fills the `sampleSlots.overviewPanel` slot with `ClientASamplePanel`.
-- `:78-81` — reacts to the `userEvents.updated` event.
+- `:39-55` — adds/overrides i18n bundles, including the `user-management` menu label "Client A Users".
+- `:57-61` — registers a client-specific service with a client-name prefix: `client-a.audit`.
+- `:63` — fills the user table slot (`userSlots.userTableActions`) with an audit button.
+- `:65-68` — overrides the `/users/:id` route — guarded by `deps.routes.has` so it stays safe when the module is absent.
+- `:71` — fills the `sampleSlots.overviewPanel` slot with `ClientASamplePanel`.
+- `:93-96` — reacts to the `userEvents.updated` event.
 
 Notice: the extension always **uses** what already exists (module routes, module slots, module public API). Not a single line here changes a module file.
 
@@ -197,7 +197,7 @@ Notice: the extension always **uses** what already exists (module routes, module
 | App entry point and boot order | `web-container/src/main.tsx:11` |
 | The `deps` contract (13 services) | `web-container/src/di/deps.ts:23` |
 | A complete module example | `web-modules/modules/module-sample/index.tsx:14` |
-| A client extension example | `web-extension-client-a/src/index.tsx:32` |
+| A client extension example | `web-extension-client-a/src/index.tsx:33` |
 
 ✅ **Chapter 1 checkpoint**
 
@@ -238,11 +238,11 @@ Open `web-extension-client-a/src/i18n/id.json` and change the panel title:
 "panelTitle": "Panel Klien A",
 ```
 
-Update `en.json` too (`"panelTitle": "Client A panel"`) so both locales stay in parity. The extension adds translations through `deps.i18n.addResourceBundle` (`src/index.tsx:38-39`) under the `client-a` namespace; components read them with `useTranslation('client-a')`.
+Update `en.json` too (`"panelTitle": "Client A panel"`) so both locales stay in parity. The extension adds translations through `deps.i18n.addResourceBundle` (`src/index.tsx:39-40`) under the `client-a` namespace; components read them with `useTranslation('client-a')`.
 
 ### Step 3 — Change one slot component
 
-The component `web-extension-client-a/src/components/ClientASamplePanel.tsx` renders in the `module-sample.overviewPanel` slot — the extension registers it at `src/index.tsx:70`, while the module declares the slot name at `web-modules/modules/module-sample/slots.ts:2`.
+The component `web-extension-client-a/src/components/ClientASamplePanel.tsx` renders in the `module-sample.overviewPanel` slot — the extension registers it at `src/index.tsx:71`, while the module declares the slot name at `web-modules/modules/module-sample/slots.ts:2`.
 
 Add one line at the end of the `Card`:
 
@@ -649,7 +649,8 @@ web-extension-client-a/
     ├── components/           # client-specific components
     ├── overrides/<module>/   # replacement pages
     ├── hooks/                # service wrappers
-    └── i18n/{en,id}.json     # the client-a namespace
+    ├── i18n/{en,id}.json     # the client-a namespace
+    └── pages/                # client-specific pages
 ```
 
 `manifest.json` holds `client`, `baseVersion` (exact), `modules`, `shared`, and `overrides`:
@@ -676,7 +677,7 @@ Always work from the lightest level. Each level and its nature is explained in `
 
 ### Step 1 — Level 1: fill a slot
 
-A module declares a slot in `slots.ts` and exports it in `public.ts` (example: `sampleSlots.overviewPanel`). The extension fills it in `init` (`src/index.tsx:70`):
+A module declares a slot in `slots.ts` and exports it in `public.ts` (example: `sampleSlots.overviewPanel`). The extension fills it in `init` (`src/index.tsx:71`):
 
 ```tsx
 import { sampleSlots } from '@arsi/module-module-sample';
@@ -690,7 +691,7 @@ deps.slots.register(sampleSlots.overviewPanel, ClientASamplePanel);
 
 ### Step 2 — Level 2: route override with a guard
 
-`override` replaces the **whole route entry** (include `meta` again) and throws when the path is not registered. That is why `client-a` uses the `overrideIfPresent` helper (`src/index.tsx:20-30`):
+`override` replaces the **whole route entry** (include `meta` again) and throws when the path is not registered. That is why `client-a` uses the `overrideIfPresent` helper (`src/index.tsx:21-31`):
 
 ```tsx
 function overrideIfPresent(
@@ -715,11 +716,11 @@ overrideIfPresent(deps, '/users/:id', {
 });
 ```
 
-The guard is **required** for routes of modules that can be disabled (`CONTRACT §12.4`). Without it, disabling a module via `config.modules` makes boot fail with `[routes] cannot override unknown route`. Init order helps: an extension always inits **after** all modules, so `routes.has` is already final. An extension may also add a new route with `deps.routes.add` — include `meta.module`.
+The guard is **required** for routes of modules that can be disabled (`CONTRACT §12.4`). Without it, disabling a module via `config.modules` makes boot fail with `[routes] cannot override unknown route`. Init order helps: an extension always inits **after** all modules, so `routes.has` is already final. An extension may also add a new route with `deps.routes.add` — include `meta.module`; the pattern is in **Step 4**.
 
 ### Step 3 — Level 3: service wrapper
 
-An extension **must not** override core services (`auth`, `user`). The correct pattern: register a new service namespaced as `<client>.<service>` (`src/index.tsx:56-60`):
+An extension **must not** override core services (`auth`, `user`). The correct pattern: register a new service namespaced as `<client>.<service>` (`src/index.tsx:57-61`):
 
 ```tsx
 const auditClient = axios.create({ baseURL: '/api/audit-client-a', timeout: 5000 });
@@ -743,7 +744,32 @@ const service = useMemo(() => {
 
 Living example: `web-extension-client-a/src/hooks/useClientASample.ts`. Full rules: `CONTRACT §4`.
 
-### Step 4 — i18n and events
+### Step 4 — Client-only new feature (route + menu)
+
+Use it when a client need has no counterpart in the base: a page and menu that do not attach to any module. Two registrations, both in `init(deps)` — example from `web-extension-client-a/src/index.tsx:79-91`:
+
+```tsx
+deps.routes.add({
+  path: '/client-a/reports',
+  element: <ClientAReportsPage />,
+  meta: { group: 'client-a', module: 'client-a' },
+});
+
+deps.menu.register({
+  path: '/client-a/reports',
+  label: 'menu.reports',
+  namespace: 'client-a',
+  order: 90,
+});
+```
+
+- The feature namespace is the client id: path `/<client>/...`, `meta: { group: '<client>', module: '<client>' }`, and an i18n bundle under the `<client>` namespace (the `menu.reports` label lives in client-a's `i18n/{en,id}.json`).
+- `web-extension-template` already ships a similar sample that derives the client id from `deps.config.client` at runtime (`src/index.tsx:17-36`, path `/<client>/sample`) — no manual edits. Delete that block if unused.
+- ⚠️ Register the route **and** the menu together: the Sidebar renders every item from `menu.getAll()` without filtering (`web-container/src/layout/Sidebar.tsx:16,33-37`), so a menu without a route (or vice versa) confuses users. Route paths **must** be unique — a duplicate throws in the registry.
+- ✅ Checkpoint: open `/<client>/...` — the menu appears in the Sidebar and the page renders.
+- 📖 Concepts and how it sits beside the three override levels → `ARCHITECTURE §7`; route rules → `CONTRACT §12.4`.
+
+### Step 5 — i18n and events
 
 Two adjustments almost every extension needs:
 
@@ -760,7 +786,7 @@ deps.events.on<UserUpdatedPayload>(userEvents.updated, (payload) => {
 });
 ```
 
-Both come from `src/index.tsx`: i18n at `:38-54`, event listener at `:78-81`.
+Both come from `src/index.tsx`: i18n at `:39-55`, event listener at `:93-96`.
 
 Allowed event directions (`CONTRACT §13`):
 
@@ -770,7 +796,7 @@ Allowed event directions (`CONTRACT §13`):
 | Extension emit → module listen | ✗ (the base must not know about the extension) |
 | Extension emit → extension listen | ✓ (namespace `<client>.<entity>.<action>`) |
 
-### Step 5 — Extension tests
+### Step 6 — Extension tests
 
 Tests for the override are **required**. The pattern in `web-extension-client-a/src/__tests__/init.test.ts`: `createFakeDeps()` + `vi.resetModules()` + dynamic import, then assert the registry calls:
 
@@ -791,7 +817,7 @@ npm run typecheck && npm test && npm run lint
 
 The first time an extension imports a module, add the `@arsi/module-<folder>` alias in the extension's `aliases.cjs` + `tsconfig.json` (see `web-extension-client-a/aliases.cjs`).
 
-### Step 6 — See the override in dev
+### Step 7 — See the override in dev
 
 ```bash
 cd web-container
